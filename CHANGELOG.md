@@ -51,8 +51,34 @@ tagged.
   own hooks — the VM-wide slot for setup shared across every repo (a swapfile,
   a global toolchain). Previously both were rejected there as repo-local.
   `on down` / `on enter` stay per-repo (they're reserved and not wired yet).
+- **`vm ( disk <size> )` sets the root-disk ceiling.** Same unit rules as
+  `memory`, minimum 1 GiB, and — like `cpu`/`memory` — resolved as the max
+  across a workspace and its repos, since one rootfs is shared by every phase.
+  Snapshotted at create and baked into the rootfs at build time.
 
 ### Changed
+
+- **Default root disk is 32 GiB, up from 8.** Dependency caches now live on
+  the per-VM rootfs (see below), and 8 GiB filled mid-build. The image is
+  sparse, so the guest's unwritten tail is a hole — but the ceiling is not
+  free: the inode table is written up front at ~1/64 of the ceiling, so a
+  built rootfs costs ~512 MiB of host disk instead of ~128 MiB. That charge
+  lands once per distinct image+size cache entry; per-VM disks reflink off it.
+
+  This changes the rootfs cache key, so the **first `clawk up` after
+  upgrading rebuilds the rootfs** for every existing sandbox (a one-time
+  flatten, minutes on a large image). Nothing in a sandbox is lost — the vz
+  rootfs is per-boot disposable by design — but the superseded 8 GiB disks sit
+  in the image cache until `clawk image gc`.
+
+- **Toolchain dependency caches are no longer shared with the host.** The Go
+  module cache and Cargo registry were mounted from a host directory; both
+  rely on file locking and atomic-rename semantics that 9p-over-vsock does not
+  honour reliably, which surfaced as checksum-mismatch module failures,
+  EACCES, stalled locks, and half-written cache entries. They now live on the
+  per-VM rootfs: a new sandbox re-downloads its module set (hence the larger
+  default disk above), which is cheaper than debugging a corrupt cache. The
+  mounts return once the 9p transport is hardened.
 
 - **The worktree rides in on its own disk instead of being copied into the
   rootfs.** Staging it used to loop-mount the rootfs as root — six privileged

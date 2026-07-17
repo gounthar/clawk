@@ -152,6 +152,15 @@ type Template struct {
 	// the guest sees at boot. Zero = provider default.
 	MemoryMaxMiB uint64
 
+	// DiskMiB overrides the sparse ext4 root-disk ceiling, in mebibytes
+	// (vm ( disk <size> )). Zero = the built-in sandbox.DefaultDiskSizeGiB.
+	// The disk is sparse, so a larger ceiling mostly costs nothing until the
+	// guest writes into it — the exception is the inode table, ~1/64 of the
+	// ceiling, written at build time (see sandbox.DefaultDiskSizeGiB). Raise
+	// it for repos with big dependency trees now that toolchain caches live
+	// on the rootfs.
+	DiskMiB uint64
+
 	// IdleTimeoutSec is the sandbox's idle-stop timeout in seconds: how
 	// long the VM may sit with no attached session and a quiescent guest
 	// before the daemon stops it to reclaim host memory. Declared as
@@ -227,6 +236,9 @@ func (t *Template) Merge(over *Template) {
 	}
 	if over.MemoryMaxMiB != 0 {
 		t.MemoryMaxMiB = over.MemoryMaxMiB
+	}
+	if over.DiskMiB != 0 {
+		t.DiskMiB = over.DiskMiB
 	}
 	if over.IdleTimeoutSec != 0 {
 		t.IdleTimeoutSec = over.IdleTimeoutSec
@@ -513,9 +525,10 @@ func (p *parser) parseCPU(tmpl *Template) error {
 	return p.expectNewlineOrEOF()
 }
 
-// parseMemory handles `memory <size>` and `memory_max <size>` — a single
-// size value in MiB, GiB, TiB (or SI MB/GB/TB). Bare numbers without a
-// unit suffix are rejected to force unit-explicit configs.
+// parseMemory is the shared size-directive parser for the vm block —
+// `memory`, `memory_max`, and `disk`. It reads a single size value in
+// MiB, GiB, TiB (or SI MB/GB/TB) into dst. Bare numbers without a unit
+// suffix are rejected to force unit-explicit configs.
 func (p *parser) parseMemory(dst *uint64, directive string) error {
 	p.advance() // consume directive name
 	val := p.peek()
@@ -620,9 +633,9 @@ func (p *parser) parseNested(tmpl *Template) error {
 }
 
 // parseVMBlock handles the `vm ( ... )` block — the scalar VM settings:
-// provider, cpu, memory, memory_max, nested, image, kernel. Each reuses a
-// dedicated per-directive parser so size-unit handling and duplicate
-// detection have a single source of truth.
+// provider, cpu, memory, memory_max, disk, nested, image, kernel. Each
+// reuses a dedicated per-directive parser so size-unit handling and
+// duplicate detection have a single source of truth.
 func (p *parser) parseVMBlock(tmpl *Template) error {
 	p.advance() // consume "vm"
 	t := p.peek()
@@ -657,6 +670,10 @@ func (p *parser) parseVMBlock(tmpl *Template) error {
 			if err := p.parseMemory(&tmpl.MemoryMaxMiB, "memory_max"); err != nil {
 				return err
 			}
+		case "disk":
+			if err := p.parseMemory(&tmpl.DiskMiB, "disk"); err != nil {
+				return err
+			}
 		case "nested":
 			if err := p.parseNested(tmpl); err != nil {
 				return err
@@ -677,7 +694,7 @@ func (p *parser) parseVMBlock(tmpl *Template) error {
 			return p.errorAt(t,
 				"unknown 'vm' directive %q (want %s)", t.Val,
 				describeFirst([]string{
-					"provider", "cpu", "memory", "memory_max", "nested", "idle_timeout", "image", "kernel",
+					"provider", "cpu", "memory", "memory_max", "disk", "nested", "idle_timeout", "image", "kernel",
 				}))
 		}
 	}

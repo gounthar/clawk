@@ -78,6 +78,38 @@ func resolveResources(ws *template.Workspace) (cpu uint, memoryMiB, memoryMaxMiB
 	return cpu, memoryMiB, memoryMaxMiB
 }
 
+// resolveDisk merges the root-disk ceiling across a workspace and its
+// repos by taking the max: the VM's rootfs is shared across every phase,
+// so the largest request wins (same rule as resolveResources). Zero
+// everywhere means sandbox.DefaultDiskSizeGiB applies at build time.
+func resolveDisk(ws *template.Workspace) uint64 {
+	disk := ws.File.DiskMiB
+	for _, r := range ws.Repos {
+		if r.Clawkfile == nil {
+			continue
+		}
+		if r.Clawkfile.DiskMiB > disk {
+			disk = r.Clawkfile.DiskMiB
+		}
+	}
+	return disk
+}
+
+// minDiskMiB is the floor for a per-sandbox `vm ( disk <size> )` override.
+// Below ~1 GiB there is no room for the base image plus any writes, and
+// such a value is almost always a unit typo (disk 32M meaning 32G). Zero
+// (unset) is exempt — it falls back to sandbox.DefaultDiskSizeGiB.
+const minDiskMiB = 1024
+
+// validateDisk rejects a disk override that is too small to be usable.
+func validateDisk(diskMiB uint64) error {
+	if diskMiB != 0 && diskMiB < minDiskMiB {
+		return fmt.Errorf(
+			"disk must be >= 1 GiB, got %d MiB (did you mean a larger unit, e.g. 32G?)", diskMiB)
+	}
+	return nil
+}
+
 // defaultIdleTimeout is how long a sandbox may sit idle (no attached
 // session, quiescent guest) before its daemon stops the VM, when the
 // config doesn't say otherwise. Generous on purpose: parking too eagerly

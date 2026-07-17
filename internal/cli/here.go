@@ -225,7 +225,7 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 
 	var nested bool
 	var cpu uint
-	var memoryMiB, memoryMaxMiB uint64
+	var memoryMiB, memoryMaxMiB, diskMiB uint64
 	var image, kernel string
 	var idleTimeoutSec int64
 	if clawkfile != nil {
@@ -233,6 +233,7 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 		cpu = clawkfile.CPU
 		memoryMiB = clawkfile.MemoryMiB
 		memoryMaxMiB = clawkfile.MemoryMaxMiB
+		diskMiB = clawkfile.DiskMiB
 		image = clawkfile.Image
 		kernel = clawkfile.Kernel
 		idleTimeoutSec = clawkfile.IdleTimeoutSec
@@ -240,6 +241,9 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 	image = finalizeImageRef(image)
 	kernel = finalizeKernelRef(kernel)
 	if err := validateResources(memoryMiB, memoryMaxMiB); err != nil {
+		return nil, false, err
+	}
+	if err := validateDisk(diskMiB); err != nil {
 		return nil, false, err
 	}
 	memoryMiB, memoryMaxMiB = normalizeMemory(memoryMiB, memoryMaxMiB)
@@ -262,10 +266,15 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 		CPU:          cpu,
 		MemoryMiB:    memoryMiB,
 		MemoryMaxMiB: memoryMaxMiB,
+		DiskMiB:      diskMiB,
 		// IdleTimeoutSec rides the same snapshot-at-create rule as every
 		// other clawk.mod value; it was the one vm(...) field this path
 		// forgot to copy when idle-stop landed, which silently pinned every
-		// cwd sandbox to the 30m default.
+		// cwd sandbox to the 30m default. Every vm(...) scalar added since
+		// must be copied here too — this path and
+		// loadOrCreateSandboxFromWorkspace are separate constructions of the
+		// same record, and a field only wired into one is silently dropped
+		// on the other.
 		IdleTimeoutSec: idleTimeoutSec,
 		Image:          image,
 		Kernel:         kernel,

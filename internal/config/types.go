@@ -508,6 +508,16 @@ type Sandbox struct {
 	// the amount allocated at boot. Zero = provider default.
 	MemoryMaxMiB uint64 `json:"memory_max_mib,omitempty"`
 
+	// DiskMiB is the sparse ext4 root-disk ceiling in mebibytes, from
+	// clawk.mod `vm ( disk <size> )`. Zero = sandbox.DefaultDiskSizeGiB.
+	// The disk is sparse, so this bounds how far the guest may grow without
+	// reserving the full size up front — but the build does write an inode
+	// table proportional to the ceiling (~1/64 of it; see
+	// sandbox.DefaultDiskSizeGiB), so a bigger ceiling is cheap, not free.
+	// It's baked into the rootfs at build time, so a change takes effect on
+	// the next rootfs (re)build.
+	DiskMiB uint64 `json:"disk_mib,omitempty"`
+
 	// IdleTimeoutSec is how long the sandbox may sit idle (no attached
 	// session, quiescent guest) before its VM daemon stops it to reclaim
 	// host memory. Zero = the built-in default; negative = never stop.

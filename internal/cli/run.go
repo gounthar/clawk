@@ -368,6 +368,11 @@ func loadOrCreateSandboxFromWorkspace(name string, ws *template.Workspace) (*con
 	}
 	memoryMiB, memoryMaxMiB = normalizeMemory(memoryMiB, memoryMaxMiB)
 
+	disk := resolveDisk(ws)
+	if err := validateDisk(disk); err != nil {
+		return nil, err
+	}
+
 	image, err := resolveImage(ws)
 	if err != nil {
 		return nil, err
@@ -392,6 +397,7 @@ func loadOrCreateSandboxFromWorkspace(name string, ws *template.Workspace) (*con
 		CPU:            cpu,
 		MemoryMiB:      memoryMiB,
 		MemoryMaxMiB:   memoryMaxMiB,
+		DiskMiB:        disk,
 		IdleTimeoutSec: resolveIdleTimeout(ws),
 		Image:          image,
 		Kernel:         kernel,

@@ -35,6 +35,7 @@ sandbox my-project (
         cpu        4
         memory     4GiB
         memory_max 8GiB
+        disk       64GiB
         nested
         image      golang:1.25
     )
@@ -100,11 +101,18 @@ sandbox my-project (
 - `sandbox <name> ( … )` — the header names the template (defaults to the
   directory when omitted: `sandbox ( … )`).
 - `vm ( … )` — runtime shape: `provider`, `cpu`, `memory`, `memory_max`,
-  `nested`, `idle_timeout`, `image`, `kernel`. Memory sizes require an
-  explicit unit, case-sensitive: IEC (`MiB`/`GiB`/`TiB`, shorthands
-  `M`/`G`/`T`) or SI (`MB`/`GB`/`TB`); SI values convert to MiB rounding
-  down (`1GB` → 953 MiB). See [Images](images.md) for `image` and
-  `kernel`, and
+  `disk`, `nested`, `idle_timeout`, `image`, `kernel`. Memory and `disk`
+  sizes require an explicit unit, case-sensitive: IEC (`MiB`/`GiB`/`TiB`,
+  shorthands `M`/`G`/`T`) or SI (`MB`/`GB`/`TB`); SI values convert to MiB
+  rounding down (`1GB` → 953 MiB). `disk` sets the root filesystem ceiling
+  (default 32 GiB, minimum 1 GiB); it's a sparse ext4 image, so most of a
+  bigger value costs nothing until the guest writes into it — budget about
+  1/64 of the ceiling (~512 MiB at 32 GiB) for the inode table, which is
+  written up front. Raise it for repos with large dependency trees. Like
+  `cpu` and `memory`, the value is snapshotted when the sandbox is created
+  and baked into the rootfs, so editing it affects the next sandbox (or the
+  next rootfs rebuild), not a running one. See [Images](images.md) for
+  `image` and `kernel`, and
   [Commands & resource usage](commands.md#resource-usage) for `idle_timeout`.
 - `network ( … )` — egress policy: `allow` / `deny` a domain or `ip <addr>`,
   plus `use <policy>…` chains — see

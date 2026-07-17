@@ -209,6 +209,7 @@ func TestParseResources(t *testing.T) {
     cpu        8
     memory     2GiB
     memory_max 16GiB
+    disk       64GiB
 )
 `
 	tmpl, err := parseBody(src)
@@ -221,6 +222,9 @@ func TestParseResources(t *testing.T) {
 	}
 	if tmpl.MemoryMaxMiB != 16384 {
 		t.Errorf("memory_max = %d MiB, want 16384", tmpl.MemoryMaxMiB)
+	}
+	if tmpl.DiskMiB != 64*1024 {
+		t.Errorf("disk = %d MiB, want %d", tmpl.DiskMiB, 64*1024)
 	}
 }
 
