@@ -134,7 +134,11 @@ sandbox my-project (
   the first boot; `up` runs on every boot. Each command runs inside the
   guest via `bash -lc` as a login shell: variable expansion, globs, and
   pipes follow bash semantics, and `/etc/profile.d` (including forwarded
-  env vars) is sourced first. This is contract — hooks may rely on it.
+  env vars) is sourced first. This is contract — hooks may rely on it. In a
+  per-repo block they run in that repo's worktree; in a
+  [workspace root](#workspace-roots) they run once at the workspace root —
+  the VM-wide slot for setup shared across every repo (a swapfile, a global
+  toolchain). (`on down` / `on enter` are reserved and not wired yet.)
 - `files ( … )` — host files copied into the guest on each `up` (credentials,
   configs that rotate rarely).
 - `shares ( … )` — host directories live-mounted via virtio-fs (good for
@@ -162,6 +166,7 @@ A workspace root is the same block with `includes ( … )`:
 sandbox acme (
     includes ( ./api ./web ./infra )
     network ( use default corp-egress )
+    on up ( "scripts/ensure-swap.sh" )
 )
 
 policy corp-egress (
@@ -172,6 +177,13 @@ policy corp-egress (
 `policy <name> ( … )` blocks beside the sandbox define the named network
 policies its `use` line references; they register into the host store when
 the sandbox is created.
+
+A workspace root may carry `on up` / `on create` hooks (only these two —
+`on down` / `on enter` stay per-repo). They run once at the workspace root,
+before each repo's own hooks, so it's the place for VM-wide setup that isn't
+tied to any single repo's directory. A repo listed in `includes` keeps its
+own per-worktree `on up` / `on create`; the two scopes are independent and
+both run.
 
 ## How clawk finds the file
 

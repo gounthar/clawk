@@ -45,6 +45,12 @@ tagged.
   required (failing sandbox creation with a message when missing), and a bare
   or quoted right-hand side (`EDITOR = vim`) sets a literal constant. Bare
   `NAME` passthrough is unchanged.
+- **Workspace-level `on up` / `on create` hooks.** A workspace root (a
+  `clawk.mod` whose sandbox block has `includes`) may now declare `on up` and
+  `on create`, which run once at the guest workspace root — before each repo's
+  own hooks — the VM-wide slot for setup shared across every repo (a swapfile,
+  a global toolchain). Previously both were rejected there as repo-local.
+  `on down` / `on enter` stay per-repo (they're reserved and not wired yet).
 
 ### Changed
 

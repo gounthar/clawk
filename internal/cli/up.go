@@ -152,6 +152,12 @@ func bringUpVZ(provider sandbox.Provider, sb *config.Sandbox) error {
 			sb.DisplayName())
 		return nil
 	}
+	// Workspace-wide `on up` runs before the per-phase hooks: it's the slot
+	// for VM-level provisioning (a swapfile, a shared daemon) the per-phase
+	// setup may depend on.
+	if err := runWorkspaceOnUp(provider, sb); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: workspace 'on up' commands failed: %v\n", err)
+	}
 	if err := runPhaseOnUp(provider, sb); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: 'on up' commands failed: %v\n", err)
 	}
@@ -253,16 +259,19 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// runPhaseOnCreate runs each phase's `on create` block inside the VM, once
-// per phase. Already-completed phases (Phase.OnCreateAt non-zero) are
-// skipped so a second `clawk up` after success doesn't re-run them.
+// runPhaseOnCreate runs the sandbox's `on create` blocks inside the VM, once
+// each: the workspace-level block first (at the workspace root, VM-wide setup
+// the per-phase hooks may lean on), then each phase's block at its worktree.
+// Already-completed blocks (OnCreateAt non-zero) are skipped so a second
+// `clawk up` after success doesn't re-run them.
 //
 // Failure is hard: the first failing command marks the sandbox
 // create-pending and returns. The VM is left running so the user can shell
 // in and investigate. The next `clawk up` re-runs `on create` from
-// scratch for the still-incomplete phases — the failed phase's
+// scratch for the still-incomplete blocks — the failed block's
 // OnCreateAt was never written, so the retry is automatic.
 func runPhaseOnCreate(provider sandbox.Provider, sb *config.Sandbox) error {
+	wsPending := len(sb.OnCreate) > 0 && sb.OnCreateAt.IsZero()
 	var anyPending bool
 	for i := range sb.Phases {
 		if len(sb.Phases[i].OnCreate) > 0 && sb.Phases[i].OnCreateAt.IsZero() {
@@ -270,7 +279,7 @@ func runPhaseOnCreate(provider sandbox.Provider, sb *config.Sandbox) error {
 			break
 		}
 	}
-	if !anyPending {
+	if !wsPending && !anyPending {
 		// Nothing to run. If the sandbox was previously create-pending and
 		// the user hand-fixed things, clear the flag so a fresh attach
 		// works. (Preserves CreatePending in genuine zero-on-create
@@ -288,6 +297,23 @@ func runPhaseOnCreate(provider sandbox.Provider, sb *config.Sandbox) error {
 	progress := hookProgress()
 	defer progress.Close()
 	wsRoot := sandbox.GuestWorkspace(provider)
+	// Workspace-level `on create` runs first — VM-wide one-time setup the
+	// per-phase hooks may depend on. Its completion is recorded on the
+	// sandbox (OnCreateAt), so a retry after a per-phase failure doesn't
+	// re-run it.
+	if wsPending {
+		for n, cmd := range sb.OnCreate {
+			label := fmt.Sprintf("on create (workspace) %d/%d", n+1, len(sb.OnCreate))
+			if err := runHookCommand(provider, sb, progress, label, wsRoot, cmd); err != nil {
+				return markCreatePending(sb, fmt.Sprintf(
+					"workspace 'on create' command %q failed: %v", cmd, err))
+			}
+		}
+		sb.OnCreateAt = time.Now()
+		if err := store.Save(sb); err != nil {
+			return fmt.Errorf("persisting workspace on-create completion: %w", err)
+		}
+	}
 	for i := range sb.Phases {
 		p := &sb.Phases[i]
 		if len(p.OnCreate) == 0 || !p.OnCreateAt.IsZero() {
@@ -299,20 +325,9 @@ func runPhaseOnCreate(provider sandbox.Provider, sb *config.Sandbox) error {
 		for n, cmd := range p.OnCreate {
 			label := fmt.Sprintf("on create %s %d/%d", phaseName, n+1, len(p.OnCreate))
 			if err := runHookCommand(provider, sb, progress, label, phaseDir, cmd); err != nil {
-				sb.CreatePending = true
-				sb.CreatePendingReason = fmt.Sprintf(
+				return markCreatePending(sb, fmt.Sprintf(
 					"phase %s 'on create' command %q failed: %v",
-					phaseName, cmd, err)
-				if saveErr := store.Save(sb); saveErr != nil {
-					return fmt.Errorf("%s (also failed to persist create-pending: %w)",
-						sb.CreatePendingReason, saveErr)
-				}
-				fmt.Fprintf(os.Stderr,
-					"sandbox %q is now create-pending; "+
-						"investigate with 'clawk debug vshell%s', "+
-						"retry with 'clawk up%s', or reset with 'clawk destroy%s'\n",
-					sb.DisplayName(), sandboxRef(sb), sandboxRef(sb), sandboxRef(sb))
-				return fmt.Errorf("%s", sb.CreatePendingReason)
+					phaseName, cmd, err))
 			}
 		}
 		p.OnCreateAt = time.Now()
@@ -325,6 +340,49 @@ func runPhaseOnCreate(provider sandbox.Provider, sb *config.Sandbox) error {
 		sb.CreatePendingReason = ""
 		if err := store.Save(sb); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// markCreatePending records a failed `on create` command on the sandbox,
+// persists it, prints the investigate/retry/reset hint, and returns the
+// failure as an error. The VM is deliberately left running so the user can
+// shell in; the next `clawk up` retries the still-incomplete blocks (the
+// failed one's OnCreateAt was never written).
+func markCreatePending(sb *config.Sandbox, reason string) error {
+	sb.CreatePending = true
+	sb.CreatePendingReason = reason
+	if saveErr := store.Save(sb); saveErr != nil {
+		return fmt.Errorf("%s (also failed to persist create-pending: %w)",
+			sb.CreatePendingReason, saveErr)
+	}
+	fmt.Fprintf(os.Stderr,
+		"sandbox %q is now create-pending; "+
+			"investigate with 'clawk debug vshell%s', "+
+			"retry with 'clawk up%s', or reset with 'clawk destroy%s'\n",
+		sb.DisplayName(), sandboxRef(sb), sandboxRef(sb), sandboxRef(sb))
+	return fmt.Errorf("%s", sb.CreatePendingReason)
+}
+
+// runWorkspaceOnUp runs the workspace-level `on up` (Sandbox.Setup) commands
+// once per boot at the guest workspace root — the parent of every phase
+// worktree. This is the CWD-independent slot a workspace clawk.mod uses for
+// VM-wide provisioning (a swapfile, a shared daemon), distinct from the
+// per-phase `on up` runPhaseOnUp runs in each worktree. Like the per-phase
+// hooks, a failure here is surfaced to the caller, which warns-and-continues
+// so one flaky command doesn't block the rest of bring-up.
+func runWorkspaceOnUp(provider sandbox.Provider, sb *config.Sandbox) error {
+	if len(sb.Setup) == 0 {
+		return nil
+	}
+	progress := hookProgress()
+	defer progress.Close()
+	wsRoot := sandbox.GuestWorkspace(provider)
+	for n, cmd := range sb.Setup {
+		label := fmt.Sprintf("on up (workspace) %d/%d", n+1, len(sb.Setup))
+		if err := runHookCommand(provider, sb, progress, label, wsRoot, cmd); err != nil {
+			return fmt.Errorf("workspace command %q: %w", cmd, err)
 		}
 	}
 	return nil

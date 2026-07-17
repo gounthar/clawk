@@ -91,7 +91,13 @@ type statusJSONNetwork struct {
 }
 
 type statusJSONSetup struct {
-	Repo  string `json:"repo"`
+	// Scope is "workspace" for the sandbox-wide hooks (which run at the guest
+	// workspace root) or "repo" for a phase's own. It exists because Repo
+	// alone can't carry the distinction: a repo directory named "workspace"
+	// would be indistinguishable from the workspace entry. Repo is empty for
+	// the workspace scope.
+	Scope string `json:"scope"`
+	Repo  string `json:"repo,omitempty"`
 	Steps int    `json:"steps"`
 }
 
@@ -183,11 +189,18 @@ func renderStatusJSON(w io.Writer, sb *config.Sandbox, liveStatus string) error 
 		Use:    effectiveUseForLog(sb),
 		Blocks: sb.Network.Blocks,
 	}
+	if len(sb.Setup) > 0 {
+		out.Setup = append(out.Setup, statusJSONSetup{
+			Scope: "workspace",
+			Steps: len(sb.Setup),
+		})
+	}
 	for _, p := range sb.Phases {
 		if len(p.Setup) == 0 {
 			continue
 		}
 		out.Setup = append(out.Setup, statusJSONSetup{
+			Scope: "repo",
 			Repo:  filepath.Base(p.Repo),
 			Steps: len(p.Setup),
 		})
@@ -302,6 +315,9 @@ func renderStatusDashboard(w io.Writer, provider sandbox.Provider, sb *config.Sa
 	}
 
 	var setupBits []string
+	if len(sb.Setup) > 0 {
+		setupBits = append(setupBits, fmt.Sprintf("workspace (%d)", len(sb.Setup)))
+	}
 	for _, p := range sb.Phases {
 		if len(p.Setup) == 0 {
 			continue

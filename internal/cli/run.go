@@ -395,7 +395,14 @@ func loadOrCreateSandboxFromWorkspace(name string, ws *template.Workspace) (*con
 		IdleTimeoutSec: resolveIdleTimeout(ws),
 		Image:          image,
 		Kernel:         kernel,
-		CreatedAt:      time.Now(),
+		// Workspace-level `on up` / `on create` — run at the workspace root,
+		// distinct from the per-repo hooks addPhases folds into each Phase.
+		// Only a true workspace root (a block with includes) carries a
+		// non-empty ws.File; a standalone clawk.mod's hooks live on its repo
+		// and reach the Phase instead, so these stay nil there.
+		Setup:     ws.File.OnUp,
+		OnCreate:  ws.File.OnCreate,
+		CreatedAt: time.Now(),
 	}
 	if err := applyNamespaceDefaults(sb); err != nil {
 		return nil, err

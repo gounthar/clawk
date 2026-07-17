@@ -197,6 +197,55 @@ func TestRunWorkspaceRepos(t *testing.T) {
 	}
 }
 
+// TestRunWorkspaceLevelHooks: a workspace root's own `on up` / `on create`
+// land on the sandbox (Sandbox.Setup / Sandbox.OnCreate — run once at the
+// workspace root), separate from the per-repo hooks that ride each phase.
+func TestRunWorkspaceLevelHooks(t *testing.T) {
+	_, _ = setupTest(t)
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "svc")
+	require.NoError(t, os.MkdirAll(repo, 0o755))
+	gitInit(t, repo)
+
+	// A per-repo hook to prove the two scopes stay distinct.
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "clawk.mod"),
+		[]byte("sandbox (\n    on up (\n        \"make deps\"\n    )\n)\n"), 0o644))
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "clawk.mod"),
+		[]byte(`sandbox (
+    vm (
+        provider vz
+    )
+    includes (
+        ./svc
+    )
+    on up (
+        "scripts/ensure-swap.sh"
+    )
+    on create (
+        "install-global-toolchain"
+    )
+)
+`), 0o644))
+
+	_, err := executeCommand(
+		"work", filepath.Join(dir, "clawk.mod"), "WS-1", "--bare",
+	)
+	require.NoError(t, err)
+
+	sb, err := store.Load("WS-1")
+	require.NoError(t, err, "sandbox not created")
+	require.Equal(t, []string{"scripts/ensure-swap.sh"}, sb.Setup,
+		"workspace-level on up should land on Sandbox.Setup")
+	require.Equal(t, []string{"install-global-toolchain"}, sb.OnCreate,
+		"workspace-level on create should land on Sandbox.OnCreate")
+
+	require.Len(t, sb.Phases, 1)
+	require.Equal(t, []string{"make deps"}, sb.Phases[0].Setup,
+		"per-repo on up must stay on the phase, not the sandbox")
+}
+
 func TestRunOnlyFiltersRepos(t *testing.T) {
 	_, _ = setupTest(t)
 

@@ -516,6 +516,29 @@ type Sandbox struct {
 	// attach boots the VM back.
 	IdleTimeoutSec int64 `json:"idle_timeout_sec,omitempty"`
 
+	// Setup holds the workspace-level `on up` commands, sourced from a
+	// workspace clawk.mod (a sandbox block with `includes`). Unlike
+	// Phase.Setup — which runs per phase in that phase's worktree — these run
+	// once per boot at the guest workspace root (the parent of every phase
+	// worktree): the CWD-independent, VM-wide slot for a swapfile, a shared
+	// daemon, or a sysctl tweak. Empty for single-repo sandboxes, whose
+	// `on up` is per-phase. Snapshotted at create like every other clawk.mod
+	// value.
+	Setup []string `json:"setup,omitempty"`
+
+	// OnCreate holds the workspace-level `on create` commands from a workspace
+	// clawk.mod — the VM-wide, once-ever counterpart to Phase.OnCreate, run at
+	// the guest workspace root before the runner first attaches (a global
+	// toolchain install, a shared clone). It participates in the same
+	// create-pending/retry flow as the per-phase hooks: a failure marks the
+	// sandbox create-pending and is retried on the next `clawk up`. Empty for
+	// single-repo sandboxes, whose `on create` is per-phase.
+	OnCreate []string `json:"on_create,omitempty"`
+	// OnCreateAt records when the workspace-level OnCreate last completed
+	// successfully. Zero means it has not run yet (or the sandbox is
+	// create-pending). Mirrors Phase.OnCreateAt.
+	OnCreateAt time.Time `json:"on_create_at,omitempty"`
+
 	// --- Status: observed runtime state, NOT user-authoritative ---------------
 	// A reconciled cache; the provider/OS is the source of truth. Reconcile via
 	// observe() before trusting these for a decision (clawk list/status/migrate
