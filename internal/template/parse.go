@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/netip"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/clawkwork/clawk/internal/envspec"
@@ -827,6 +829,19 @@ func (p *parser) parseNetworkEntry(tmpl *Template, deny bool) error {
 	if isKeyword(t.Val) {
 		return p.errorAt(t, "unexpected keyword %q in network entry", t.Val)
 	}
+	// A bare entry that is actually an IP or CIDR is a silent footgun: it
+	// parses fine but lands in the domain list, which is only matched at
+	// DNS-resolution time — so a raw connect to that address is denied with
+	// no hint why. Steer to the explicit `ip` form. (The CLI's
+	// classifyAllowEntry enforces the same rule for `clawk network allow`.)
+	if looksLikeAddress(t.Val) {
+		directive := "allow"
+		if deny {
+			directive = "deny"
+		}
+		return p.errorAt(t, "%q is an IP or CIDR, not a domain — write %q instead (bare %q entries are domains, matched only at DNS resolution)",
+			t.Val, directive+" ip "+t.Val, directive)
+	}
 	if deny {
 		tmpl.DenyDomains = append(tmpl.DenyDomains, t.Val)
 	} else {
@@ -834,6 +849,18 @@ func (p *parser) parseNetworkEntry(tmpl *Template, deny bool) error {
 	}
 	p.advance()
 	return nil
+}
+
+// looksLikeAddress reports whether a bare network-entry token is really an
+// IP address or CIDR range rather than a domain. Any '/' marks a CIDR (a
+// domain never contains one, valid or not); otherwise a token that parses
+// as an IP address is one.
+func looksLikeAddress(s string) bool {
+	if strings.Contains(s, "/") {
+		return true
+	}
+	_, err := netip.ParseAddr(s)
+	return err == nil
 }
 
 // parseSkillsBlock handles `skills ( <path> [<version>] ... )`. Each entry

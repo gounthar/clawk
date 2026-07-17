@@ -73,6 +73,9 @@ func TestParseErrors(t *testing.T) {
 		{"provider keyword", "vm (\nprovider provider\n)\n", "reserved"},
 		{"ip without arg", "network (\nallow ip\n)", "expected IP"},
 		{"bare keyword in network entry", "network (\nallow ip 1.2.3.4\nallow vm\n)", "unexpected keyword"},
+		{"bare CIDR in allow suggests 'ip'", "network (\nallow 10.20.0.0/15\n)", "allow ip 10.20.0.0/15"},
+		{"bare IP in allow rejected", "network (\nallow 10.0.0.5\n)", "is an IP or CIDR"},
+		{"bare CIDR in deny suggests 'ip'", "network (\ndeny 192.168.0.0/24\n)", "deny ip 192.168.0.0/24"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
