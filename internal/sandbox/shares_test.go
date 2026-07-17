@@ -17,6 +17,9 @@ func TestToolchainCacheSharesEmptyCacheDir(t *testing.T) {
 }
 
 func TestToolchainCacheShares(t *testing.T) {
+	if !ToolchainCachesEnabled {
+		t.Skip("toolchain cache shares are disabled (see ToolchainCachesEnabled)")
+	}
 	cacheDir := t.TempDir()
 
 	want := []HostShare{
