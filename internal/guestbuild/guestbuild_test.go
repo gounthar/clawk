@@ -15,6 +15,10 @@ import (
 // the first time for the guest modules' deps) and exercises the cache.
 // This is the host-side equivalent of agentembed's compile test, plus
 // the init module that only this package builds.
+//
+// It drives buildFromSource rather than Build, because it is specifically
+// about the compile path: Build short-circuits to the embedded binaries when
+// the artifact ships them, which is what TestBuildUsesPrebuiltWithoutGo covers.
 func TestBuild(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("`go` not on PATH")
@@ -24,8 +28,8 @@ func TestBuild(t *testing.T) {
 	}
 
 	cache := t.TempDir()
-	bins, err := Build(context.Background(), cache, runtime.GOARCH)
-	require.NoError(t, err, "Build")
+	bins, err := buildFromSource(context.Background(), cache, runtime.GOARCH)
+	require.NoError(t, err, "buildFromSource")
 	require.False(t, bins.Cached, "fresh build reported Cached")
 	for _, p := range []string{bins.Init, bins.Agent, bins.TimeSync} {
 		fi, err := os.Stat(p)
@@ -40,8 +44,8 @@ func TestBuild(t *testing.T) {
 		// cache hit must not rewrite the files.
 		before, err := os.Stat(bins.Init)
 		require.NoError(t, err)
-		again, err := Build(context.Background(), cache, runtime.GOARCH)
-		require.NoError(t, err, "cached Build")
+		again, err := buildFromSource(context.Background(), cache, runtime.GOARCH)
+		require.NoError(t, err, "cached buildFromSource")
 		require.Equal(t, bins.Init, again.Init, "cache key changed: %s != %s", again.Init, bins.Init)
 		require.True(t, again.Cached, "second build did not report Cached")
 		after, err := os.Stat(bins.Init)

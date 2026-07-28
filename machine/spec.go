@@ -3,6 +3,7 @@ package machine
 import (
 	"fmt"
 	"net"
+	"os"
 )
 
 // Spec describes a VM. It is the input to Backend.New.
@@ -198,6 +199,27 @@ type UserMode struct {
 	// ignored by backends that attach the fd NIC.
 	GuestTAP string
 	HostTAP  string
+
+	// HostTAPFile, when set, is an already-open fd for the gvproxy-side TAP,
+	// and HostTAP is ignored. It exists so the TAP can live in a network
+	// namespace the backend is not in: creating a TAP needs CAP_NET_ADMIN,
+	// but a TAP fd is namespace-agnostic once open, so the caller creates it
+	// wherever it has that capability (for clawk, an unprivileged user
+	// namespace) and passes the fd here. Ownership transfers to the backend.
+	//
+	// The raw fd MUST be put in nonblocking mode before it is wrapped in the
+	// os.File, so Go's poller owns it and closing the file interrupts an
+	// in-flight read; backends reject a blocking fd rather than deadlock on
+	// shutdown.
+	HostTAPFile *os.File
+
+	// NetNSExec, when set, is an argv prefix that re-execs its arguments
+	// inside the VM's network namespace — e.g. {"/proc/self/exe",
+	// "__in-netns", "/proc/1234/ns/net", "--"}. The backend prepends it when
+	// spawning the hypervisor, so the VM's NIC lives in that namespace while
+	// gvproxy keeps the backend's own (which is where its egress sockets have
+	// to be). Empty leaves the hypervisor in the current namespace.
+	NetNSExec []string
 }
 
 func (UserMode) isNet() {}

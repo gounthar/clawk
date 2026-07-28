@@ -122,9 +122,9 @@ not a sandboxed process."
 ## Install
 
 Requires macOS 14+ on Apple silicon. (Linux is supported via firecracker and
-currently experimental; see
-[VM providers](docs/commands.md#vm-providers) for the gaps. This README is
-macOS-first.)
+currently experimental — start with
+**[docs/linux-quickstart.md](docs/linux-quickstart.md)**, which covers setup,
+the workflow, and the gaps. This README is macOS-first.)
 
 ```sh
 brew install clawkwork/tap/clawk
@@ -138,8 +138,10 @@ make install
 ```
 
 Either way there's no extra host tooling: no Docker, no qemu, no sudo. The
-hypervisor is Apple's Virtualization.framework, linked into the binary. First
-run probes for anything missing and offers to fix it.
+hypervisor is Apple's Virtualization.framework, linked into the binary, and the
+release binaries carry the in-guest agent prebuilt — so a Go toolchain is only
+needed if you build from source, in which case you have one. First run probes
+for anything missing and offers to fix it.
 
 **Uninstall:** `clawk destroy` your sandboxes, `rm -rf ~/.clawk`, then remove
 the binary with `brew uninstall clawk` (or delete it from `$GOBIN` for a

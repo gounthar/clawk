@@ -44,6 +44,27 @@ jobs:
           go vet ./...
           go test ./...
 
+      # The release path, which the tests above can't reach: a plain checkout
+      # embeds no guest binaries, so the prebuilt tests skip themselves. Run
+      # the generator, then assert a sandbox can be prepared with no Go
+      # toolchain — the whole point of shipping them prebuilt.
+      - name: prebuilt guest binaries — generate + use without a toolchain
+        run: |
+          make guestbin
+          go test ./internal/guestbuild/ -run 'TestBuildUsesPrebuilt|TestPrebuiltRejectsStaleSources' -v
+
+      # Cross-build both release artifacts, so a tag can't be the first time we
+      # discover the Linux release doesn't compile.
+      - name: cross-build linux release artifacts
+        run: |
+          for arch in amd64 arm64; do
+            make clean-guestbin
+            make guestbin GUEST_ARCH="$arch"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -trimpath -o "/tmp/clawk-linux-$arch" ./cmd/clawk
+            ls -l "/tmp/clawk-linux-$arch"
+          done
+
   macos:
     runs-on: macos-14 # Apple Silicon — required for the vz provider
     steps:

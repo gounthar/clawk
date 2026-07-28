@@ -77,10 +77,13 @@ func checkSpec(spec machine.Spec) error {
 			// ok
 		case machine.UserMode:
 			// gvproxy bridges to firecracker only in TAP-bridge mode: the VM
-			// boots on GuestTAP and gvproxy is pumped to HostTAP. The fd-NIC
-			// mode (both empty) has no firecracker analogue.
-			if nn.GuestTAP == "" || nn.HostTAP == "" {
-				return fmt.Errorf("%w: firecracker UserMode requires GuestTAP and HostTAP (TAP-bridge mode)", machine.ErrUnsupportedSpec)
+			// boots on GuestTAP and gvproxy is pumped to the host-side TAP,
+			// given either by name (HostTAP) or as an already-open fd
+			// (HostTAPFile, for a TAP in another network namespace — which we
+			// could not open by name from here). The fd-NIC mode (nothing set)
+			// has no firecracker analogue.
+			if nn.GuestTAP == "" || (nn.HostTAP == "" && nn.HostTAPFile == nil) {
+				return fmt.Errorf("%w: firecracker UserMode requires GuestTAP plus HostTAP or HostTAPFile (TAP-bridge mode)", machine.ErrUnsupportedSpec)
 			}
 		case machine.Unixgram:
 			return fmt.Errorf("%w: firecracker does not support %T net", machine.ErrUnsupportedSpec, n)
@@ -218,14 +221,23 @@ func (v *vm) startUserMode() error {
 		SockPath: filepath.Join(v.stateDir, "gvproxy.sock"),
 		Forwards: um.Forwards,
 		Filter:   um.Filter,
+		ID:       v.spec.ID,
 	})
 	if err != nil {
 		return fmt.Errorf("firecracker: gvproxy: %w", err)
 	}
-	tap, err := openTAP(um.HostTAP)
-	if err != nil {
+	// A caller that created the TAP in another network namespace hands us its
+	// fd instead of a name — we could not open it by name from here.
+	tap := um.HostTAPFile
+	if tap == nil {
+		tap, err = openTAP(um.HostTAP)
+		if err != nil {
+			stack.Close()
+			return fmt.Errorf("firecracker: open host tap %q: %w", um.HostTAP, err)
+		}
+	} else if err := requireNonblockingTAP(tap); err != nil {
 		stack.Close()
-		return fmt.Errorf("firecracker: open host tap %q: %w", um.HostTAP, err)
+		return fmt.Errorf("firecracker: host tap fd: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := startPump(ctx, tap, stack.VMSocket); err != nil {
@@ -239,6 +251,17 @@ func (v *vm) startUserMode() error {
 	v.umCancel = cancel
 	v.umMAC = stack.GuestMAC
 	return nil
+}
+
+// netNSExecPrefix returns the argv prefix that puts the hypervisor in the
+// VM's network namespace, or nil to spawn it in ours. See
+// machine.UserMode.NetNSExec.
+func (v *vm) netNSExecPrefix() []string {
+	um, ok := v.userModeNet()
+	if !ok || len(um.NetNSExec) == 0 {
+		return nil
+	}
+	return append([]string(nil), um.NetNSExec...)
 }
 
 // stopUserMode tears down the gvproxy stack and frame pump. Idempotent.
@@ -543,7 +566,12 @@ func (v *vm) spawn(_ context.Context) error {
 		defer consoleFile.Close()
 	}
 
-	cmd := exec.Command(Name, "--api-sock", apiSock)
+	// A UserMode net may ask for the VM to live in another network namespace
+	// (the guest's TAP is there, and only there). The prefix re-execs us into
+	// it; gvproxy deliberately stays behind in this one, since its egress
+	// sockets belong to the host's network.
+	argv := append(v.netNSExecPrefix(), Name, "--api-sock", apiSock)
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdout = consoleFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

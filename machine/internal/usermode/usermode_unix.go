@@ -29,17 +29,18 @@ import (
 	"github.com/containers/gvisor-tap-vsock/pkg/virtualnetwork"
 )
 
-// Default addresses gvproxy assigns. The MACs are fixed so the DHCP static
-// lease on the gvproxy side always matches the NIC MAC we configure on the
-// hypervisor side — a MAC drift produces a dynamic lease on a different IP,
-// which silently breaks every port forward.
+// Default addresses gvproxy assigns. The gateway MAC is fixed; the guest MAC
+// is derived per VM (see guestMAC). Whatever the value, gvproxy's DHCP static
+// lease and the NIC MAC the hypervisor configures must agree — a MAC drift
+// produces a dynamic lease on a different IP, which silently breaks every
+// port forward.
 const (
 	defaultMTU        = 1500
 	defaultSubnet     = "192.168.127.0/24"
 	defaultGatewayIP  = "192.168.127.1"
 	defaultGatewayMAC = "5a:94:ef:e4:0c:ee"
 	defaultGuestIP    = "192.168.127.2"
-	defaultGuestMAC   = "5a:94:ef:e4:0c:dd"
+	fallbackGuestMAC  = "5a:94:ef:e4:0c:dd"
 
 	// macOS ships unix-socket buffers in the single-digit KB by default.
 	// Fine for DHCP-sized frames, silently drops fragmented TCP once the
@@ -70,6 +71,11 @@ type Config struct {
 	// into the gvproxy Configuration (not a process global), so multiple
 	// Stacks can run concurrently with independent filters.
 	Filter machine.Filter
+
+	// ID identifies the VM this stack serves; it seeds the guest MAC so
+	// concurrently running VMs don't share an L2 identity. Empty is
+	// tolerated (fallbackGuestMAC) but only safe for one VM at a time.
+	ID string
 }
 
 // Stack is a running UserMode network. A backend obtains one via Start,
@@ -125,7 +131,7 @@ func Start(cfg Config) (_ *Stack, err error) {
 	return &Stack{
 		VMSocket: vmSocket,
 		GuestIP:  defaultGuestIP,
-		GuestMAC: defaultGuestMAC,
+		GuestMAC: guestMAC(cfg.ID),
 		host:     host,
 		vn:       vn,
 		cfg:      cfg,
@@ -353,6 +359,27 @@ func bumpBuffers(c *net.UnixConn, bytes int) error {
 	return setErr
 }
 
+// guestMAC derives a stable, VM-unique MAC from id.
+//
+// Every VM used to get the same hardcoded address. On vz that is invisible
+// (each VM has its own private L2 segment), but on firecracker all guests
+// share one host bridge: two sandboxes at once claimed the same MAC and the
+// same IPv6 link-local, flapping the bridge's forwarding table and delivering
+// frames to the wrong guest ("duplicate address detected" in the console).
+//
+// Deterministic in id, so a MAC survives reboots and suspend/restore — the
+// gvproxy static lease keys on it, and a drifting MAC would move the guest to
+// a dynamic IP and silently break every port forward. 0x5a keeps the
+// locally-administered bit set and the multicast bit clear.
+func guestMAC(id string) string {
+	if id == "" {
+		return fallbackGuestMAC
+	}
+	sum := sha256.Sum256([]byte("clawk-guest-mac:" + id))
+	return fmt.Sprintf("5a:%02x:%02x:%02x:%02x:%02x",
+		sum[0], sum[1], sum[2], sum[3], sum[4])
+}
+
 func buildGvproxyConfig(cfg Config) *types.Configuration {
 	forwards := make(map[string]string, len(cfg.Forwards))
 	for _, f := range cfg.Forwards {
@@ -365,7 +392,9 @@ func buildGvproxyConfig(cfg Config) *types.Configuration {
 		GatewayIP:         defaultGatewayIP,
 		GatewayMacAddress: defaultGatewayMAC,
 		DHCPStaticLeases: map[string]string{
-			defaultGuestIP: defaultGuestMAC,
+			// Must match Stack.GuestMAC — the backend configures that on the
+			// NIC, and a mismatch downgrades the guest to a dynamic lease.
+			defaultGuestIP: guestMAC(cfg.ID),
 		},
 		Forwards: forwards,
 		NAT: map[string]string{

@@ -85,11 +85,22 @@ type User struct {
 // the virtio-fs share, and a 9p-capable init falls back to it if the 9p mount
 // fails (e.g. a kernel without CONFIG_NET_9P_FD). This keeps the change
 // additive — no Version bump, no forced sandbox recreation.
+//
+// Block selects a third transport, for hosts with no file-sharing transport
+// at all: firecracker has neither virtio-fs nor (with the firecracker-CI
+// kernel) 9p, so its worktree rides in on its own virtio-blk disk, built on
+// the host in userspace (machine/oci.WriteDirDisk). Block is the in-guest
+// device path and takes precedence over both other transports; Tag is
+// irrelevant to it. Additive like NinePVSockPort — an older clawk-init
+// ignores it, which is safe because only the firecracker provider sets it
+// and its guest binaries are rebuilt from the same source tree.
 type Mount struct {
 	Tag            string `json:"tag"`
 	Path           string `json:"path"`
 	ReadOnly       bool   `json:"ro,omitempty"`
 	NinePVSockPort uint32 `json:"ninep_port,omitempty"`
+	Block          string `json:"block,omitempty"`  // e.g. "/dev/vdc"
+	FSType         string `json:"fstype,omitempty"` // defaults to ext4
 }
 
 // File is one file written into the guest at boot. Content is raw bytes

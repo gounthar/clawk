@@ -7,9 +7,11 @@
 // static binaries are baked into the rootfs by machine/oci's inject
 // support.
 //
-// Results are cached under <cacheDir>/guestbin/<hash>/, keyed by the
-// source content, target arch and Go toolchain version, so the ~seconds
-// build cost is paid once per clawk version.
+// Release binaries carry these prebuilt (see internal/agentembed/prebuilt.go),
+// so an installed clawk needs no Go toolchain at all. Building from source
+// leaves them out and they are compiled here on first use instead, cached
+// under <cacheDir>/guestbin/<hash>/ keyed by source content, target arch and
+// toolchain version — so the ~seconds cost is paid once per clawk version.
 package guestbuild
 
 import (
@@ -50,10 +52,13 @@ func modules() []module {
 	}
 }
 
-// Build compiles the guest binaries for linux/<arch>, reusing a previous
-// build when sources, arch and toolchain are unchanged. Requires `go` on
-// PATH; the first build also needs network access for the guest modules'
-// dependencies (cached by the host's module cache afterwards).
+// Build returns the guest binaries for linux/<arch>.
+//
+// A release binary embeds them (see internal/agentembed/prebuilt.go), so this
+// only unpacks and returns — no Go toolchain, no network. A source build has
+// nothing embedded and compiles them from the embedded sources instead,
+// caching the result; that path needs `go` on PATH, and network the first time
+// for the guest modules' dependencies.
 func Build(ctx context.Context, cacheDir, arch string) (Binaries, error) {
 	if cacheDir == "" {
 		return Binaries{}, fmt.Errorf("guestbuild: cacheDir is required")
@@ -61,10 +66,29 @@ func Build(ctx context.Context, cacheDir, arch string) (Binaries, error) {
 	if arch == "" {
 		return Binaries{}, fmt.Errorf("guestbuild: arch is required")
 	}
+	if bins, ok := fromPrebuilt(cacheDir, arch); ok {
+		return bins, nil
+	}
+	return buildFromSource(ctx, cacheDir, arch)
+}
+
+// Prebuilt reports whether this binary carries guest binaries for arch, i.e.
+// whether a sandbox can boot with no Go toolchain present. `clawk doctor` asks,
+// so it can tell a hard prerequisite from an optional one.
+func Prebuilt(arch string) bool {
+	_, m, ok := agentembed.Prebuilt()
+	return ok && m.Arch == arch && m.SourcesSHA256 == agentembed.SourcesHash()
+}
+
+// buildFromSource compiles the guest binaries, reusing a previous build when
+// sources, arch and toolchain are unchanged.
+func buildFromSource(ctx context.Context, cacheDir, arch string) (Binaries, error) {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
 		return Binaries{}, fmt.Errorf(
-			"guestbuild: `go` not found — the Go toolchain is required to build the guest agent (install from https://go.dev/dl or brew install go)")
+			"guestbuild: `go` not found — this clawk was built from source, so it needs the Go " +
+				"toolchain to compile the guest agent (install from https://go.dev/dl or brew install go). " +
+				"Release binaries ship the guest agent prebuilt and need no toolchain")
 	}
 
 	key, err := cacheKey(goBin, arch)

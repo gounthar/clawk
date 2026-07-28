@@ -22,3 +22,8 @@ debug-logs/
 # Local Claude Code settings and skills (personal, not shared)
 .claude/settings.local.json
 .claude/skills/
+
+# Working notes: implementation plans, scratch write-ups. Kept out of the
+# repo because they age into fiction the moment the code lands — the design
+# rationale that matters belongs in the code and in docs/.
+.plans/

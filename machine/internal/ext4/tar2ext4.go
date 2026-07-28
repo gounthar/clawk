@@ -82,7 +82,18 @@ func Convert(r io.Reader, w io.ReadWriteSeeker, opts ...ConvertOption) error {
 		}
 		name, ok := normalize(hdr.Name)
 		if !ok {
-			continue
+			// The one entry normalize rejects that still carries information
+			// is the root's own ("/", ".", "./"): its mode and ownership
+			// belong to the image root, which the writer otherwise leaves at
+			// 0755 root:root. That default makes a mounted tree's root
+			// unwritable to any non-root guest user even though every file
+			// inside it has the right owner, so honor it. Only a directory
+			// entry can describe the root; anything else naming it is
+			// nonsense (a hardlink to the root, notably, is not a thing).
+			if hdr.Typeflag != tar.TypeDir || !namesRoot(hdr.Name) {
+				continue
+			}
+			name = "" // how compactext4 spells the root
 		}
 		if strings.HasPrefix(path.Base(name), ".wh.") {
 			return fmt.Errorf("ext4: whiteout entry %q: input must be a flattened tar", hdr.Name)
@@ -186,4 +197,11 @@ func normalize(name string) (string, bool) {
 		return "", false
 	}
 	return name, true
+}
+
+// namesRoot reports whether a tar entry path refers to the archive root itself
+// rather than to something inside it. Note it does NOT accept "..": that
+// escapes the root, and path.Clean("/"+name) would flatten the difference.
+func namesRoot(name string) bool {
+	return path.Clean(strings.TrimPrefix(name, "/")) == "."
 }

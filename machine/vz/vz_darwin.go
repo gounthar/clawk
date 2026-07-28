@@ -856,6 +856,7 @@ func (v *vm) build() (_ *codevz.VirtualMachineConfiguration, _ *codevz.VirtualMa
 				SockPath: sockPath,
 				Forwards: nn.Forwards,
 				Filter:   nn.Filter,
+				ID:       v.spec.ID,
 			})
 			if err != nil {
 				return nil, nil, fmt.Errorf("vz: usermode stack: %w", err)

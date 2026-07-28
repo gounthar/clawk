@@ -27,6 +27,11 @@ import (
 // remove. Call only for a sandbox created in this same invocation; best-effort,
 // so cleanup errors are warned rather than masking the boot error.
 func rollbackFailedCreate(sb *config.Sandbox) {
+	// Destroy removes the VM dir, and the daemon log inside it is usually the
+	// only record of WHY the boot failed (the CLI's own error is often just a
+	// vsock timeout). Salvage its verdict before deleting it, or a first-boot
+	// failure is undiagnosable without re-running by hand.
+	reportDaemonFailure(sb)
 	if provider, err := providerFor(sb); err == nil {
 		if err := provider.Destroy(sb); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: rolling back VM for %q: %v\n", sb.DisplayName(), err)
@@ -34,6 +39,51 @@ func rollbackFailedCreate(sb *config.Sandbox) {
 	}
 	if err := store.Delete(sb.Name); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: rolling back sandbox record %q: %v\n", sb.DisplayName(), err)
+	}
+}
+
+// reportDaemonFailure prints the VM daemon's own verdict to stderr, for a
+// sandbox whose VM dir is about to be deleted. It prefers the FATAL line the
+// daemon logs on its way out (see the deferred logger in __vzd/__fcd) and
+// falls back to the tail, so the user sees "bridge: sudo … a password is
+// required" rather than only the CLI's downstream "agent did not become
+// ready". Silent when there's no log — a failure before the daemon started.
+func reportDaemonFailure(sb *config.Sandbox) {
+	vmDir := store.VMDir(sb.Name)
+	for _, name := range []string{"fcd.log", "vzd.log"} {
+		path := filepath.Join(vmDir, name)
+		data, err := os.ReadFile(path)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		var fatal string
+		var lines []string
+		for _, l := range strings.Split(string(data), "\n") {
+			if strings.TrimSpace(l) == "" {
+				continue
+			}
+			lines = append(lines, l)
+			if strings.Contains(l, "FATAL:") {
+				fatal = l
+			}
+		}
+		switch {
+		case fatal != "":
+			fmt.Fprintf(os.Stderr, "daemon log (%s): %s\n", path, fatal)
+		case len(lines) > 0:
+			if len(lines) > 5 {
+				lines = lines[len(lines)-5:]
+			}
+			fmt.Fprintf(os.Stderr, "daemon log (%s), last %d lines:\n%s\n",
+				path, len(lines), strings.Join(lines, "\n"))
+		default:
+			// Present but with nothing printable in it — a partially flushed
+			// log, or a boot killed just after the file was created. Returning
+			// here would consume the whole function and leave the other
+			// daemon's log, which may hold the actual FATAL line, unread.
+			continue
+		}
+		return
 	}
 }
 
