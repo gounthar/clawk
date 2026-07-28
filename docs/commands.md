@@ -131,13 +131,17 @@ without notice.
 | Provider           | Host  | Notes                                                                 |
 |--------------------|-------|-----------------------------------------------------------------------|
 | `vz` (default)     | macOS | Apple Virtualization.framework; no sudo. Live-mounts your worktree.   |
-| `firecracker` (experimental) | Linux | KVM microVM. Bakes the worktree into the rootfs (host edits don't propagate live), and skips host-file push, ssh-agent forwarding, and per-phase hooks today. |
+| `firecracker` (experimental) | Linux | KVM microVM; no sudo on hosts that allow unprivileged user namespaces. Carries the worktree on its own disk (host edits don't propagate live), and skips host-file push, ssh-agent forwarding, and per-phase hooks today. |
 
 Pick one with `--provider`; the choice persists with the sandbox. Both run the
 same OCI rootfs, vsock agent, and egress allow-list — see
 [ARCHITECTURE.md](../ARCHITECTURE.md) for how they differ under the hood.
 
 ### Linux prerequisites (firecracker)
+
+> New to clawk on Linux? **[linux-quickstart.md](linux-quickstart.md)** walks
+> the whole path — setup, first run, the workflow, and what isn't there yet.
+> This section is the reference detail.
 
 The firecracker provider needs three things on the host; `clawk doctor`
 checks all of them:
@@ -153,10 +157,46 @@ checks all of them:
   Without this, boots fail with firecracker's opaque
   `Permission denied (os error 13) ... /dev/kvm file's ACL`; `clawk up`
   now surfaces the kvm-group fix directly.
-- **A Go toolchain** — used to cross-compile the tiny in-guest binaries on
-  first boot. Any `go` ≥ 1.21 works (older toolchains auto-download the one
-  the guest modules pin via `GOTOOLCHAIN=auto`).
+- **`nsenter`** (from `util-linux`, already installed on mainstream distros) —
+  used by rootless mode to launch the VM inside its network namespace. Missing
+  it isn't fatal: clawk falls back to bridge mode and says so.
 
-`clawk` shells out to `sudo` for the host bridge/TAP plumbing (`ip link`,
-`ip tuntap`) and to stage the worktree into the rootfs at create — never to
-run the VM itself, which firecracker does unprivileged against `/dev/kvm`.
+A **Go toolchain** is not among them. A release binary carries the tiny
+in-guest binaries prebuilt, and `clawk doctor` says so
+(`host: go toolchain — not needed`). It's a prerequisite only for a clawk built
+from source, which cross-compiles them on first boot; any `go` ≥ 1.21 works
+there (older toolchains auto-download the one the guest modules pin via
+`GOTOOLCHAIN=auto`).
+
+#### Privileges: rootless by default, sudo only as a fallback
+
+Creating a VM's network devices (a bridge and two TAPs) needs
+`CAP_NET_ADMIN`. clawk gets it without sudo by running each sandbox's network
+in its own **unprivileged user + network namespace**: inside a namespace you
+own, you are root over your own network. Nothing else needs privilege —
+firecracker itself runs unprivileged against `/dev/kvm`, and the worktree disk
+is built in userspace. So on a host that allows unprivileged user namespaces,
+a sandbox boots with **no privileged operation at all**, and no clawk
+interfaces appear on the host.
+
+`clawk doctor` reports which mode is in use under `host: network mode`:
+
+- **`rootless`** — the default. Nothing to configure; the namespace (and every
+  device in it) is created and destroyed with the VM.
+- **`bridge mode via sudo`** — the fallback for hosts that forbid unprivileged
+  user namespaces. Ubuntu 24.04+ is the common case: it blocks them via
+  AppArmor. Getting rootless mode there takes one root action, once:
+  `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist it
+  in `/etc/sysctl.d/` if you want it to survive a reboot) — verified. The
+  narrower alternative is an AppArmor profile for the clawk binary granting
+  `userns,`, which keeps the restriction on for everything else; that route is
+  documented by Ubuntu but has not been tested here. In bridge mode clawk
+  creates host devices with
+  `sudo ip`: it prompts at most **once per sandbox** (never per boot — later
+  boots find the devices configured and touch no privilege), and it prompts in
+  the foreground rather than inside the background VM daemon, which has no
+  terminal to authenticate on. `NOPASSWD` for `ip` avoids the prompt entirely,
+  at the cost of granting network reconfiguration.
+
+Pin a mode with `CLAWK_NET_MODE=rootless|bridge` — useful to assert that no
+sudo will ever be attempted (`rootless` fails loudly instead of falling back).

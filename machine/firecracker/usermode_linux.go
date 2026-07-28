@@ -66,6 +66,43 @@ func openTAP(name string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), "/dev/net/tun:"+name), nil
 }
 
+// requireNonblockingTAP verifies a TAP fd handed in from elsewhere (a
+// namespace-owning helper, over SCM_RIGHTS) is already nonblocking, as
+// openTAP's own fds are.
+//
+// It checks rather than fixes, because this cannot be fixed from here:
+// os.NewFile decides whether to register the fd with Go's runtime poller
+// based on its blocking state at that moment, and a File wrapped around a
+// blocking fd never joins the poller — so Close could not interrupt the
+// pump's in-flight Read, and flipping O_NONBLOCK behind the File's back
+// would instead turn that Read into a permanent EAGAIN. The sender has to
+// SetNonblock on the raw fd before wrapping it; this catches the mistake
+// with a message that says so, instead of a pump that won't shut down.
+//
+// SyscallConn (not Fd) because Fd itself removes the file from the poller.
+func requireNonblockingTAP(f *os.File) error {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("tap fd: %w", err)
+	}
+	var flags int
+	var errno syscall.Errno
+	if cerr := rc.Control(func(fd uintptr) {
+		r, _, e := syscall.Syscall(syscall.SYS_FCNTL, fd, syscall.F_GETFL, 0)
+		flags, errno = int(r), e
+	}); cerr != nil {
+		return fmt.Errorf("tap fd: %w", cerr)
+	}
+	if errno != 0 {
+		return fmt.Errorf("tap fd F_GETFL: %w", errno)
+	}
+	if flags&syscall.O_NONBLOCK == 0 {
+		return fmt.Errorf("tap fd is in blocking mode: set O_NONBLOCK on the raw fd " +
+			"before wrapping it with os.NewFile, or the frame pump cannot be shut down")
+	}
+	return nil
+}
+
 // frameConn is the message-oriented half of *os.File / *net.UnixConn: each
 // Read yields exactly one frame/datagram and each Write sends exactly one.
 type frameConn interface {

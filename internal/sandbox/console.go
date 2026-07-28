@@ -15,6 +15,14 @@ import (
 // time (kernel panics, clawk-init errors, missing init binaries); making
 // the CLI surface it directly turns "go read this file" into an answer.
 func ConsoleTail(path string, n int) string {
+	return LogTail(path, n, "last guest console output")
+}
+
+// LogTail is ConsoleTail for any log file, with a caller-chosen label. The
+// host-side daemon log needs the same treatment as the guest console: it
+// holds the real cause of most boot failures, and on a first `clawk` in a
+// directory the rollback deletes it moments later.
+func LogTail(path string, n int, label string) string {
 	data, err := os.ReadFile(path)
 	if err != nil || len(data) == 0 {
 		return ""
@@ -31,6 +39,6 @@ func ConsoleTail(path string, n int) string {
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
 	}
-	return fmt.Sprintf("\n--- last guest console output (%s) ---\n%s\n---",
-		path, strings.Join(lines, "\n"))
+	return fmt.Sprintf("\n--- %s (%s) ---\n%s\n---",
+		label, path, strings.Join(lines, "\n"))
 }

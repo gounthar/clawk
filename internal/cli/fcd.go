@@ -97,13 +97,23 @@ func runFcd(_ *cobra.Command, args []string) (retErr error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// The provider sets up the host bridge/TAPs and returns the spec, whose
-	// UserMode net carries the egress filter; the backend brings up gvproxy.
+	// The provider wires up the sandbox's network — a private namespace it
+	// creates here (rootless) or the host devices the CLI pre-created (bridge)
+	// — and returns the spec, whose UserMode net carries the egress filter;
+	// the backend brings up gvproxy.
 	prov := sandbox.NewFirecrackerProvider(store)
-	spec, err := prov.DaemonSpec(sb, allow)
+	if mode, why := prov.NetModeForLog(); why != "" {
+		logger.Printf("network mode: %s (%s)", mode, why)
+	} else {
+		logger.Printf("network mode: %s", mode)
+	}
+	spec, netCleanup, err := prov.DaemonSpec(sb, allow)
 	if err != nil {
 		return fmt.Errorf("building spec: %w", err)
 	}
+	// Releases the network namespace (rootless) once the VM is gone; a no-op in
+	// bridge mode, whose devices outlive the daemon by design.
+	defer netCleanup()
 	logger.Printf("spec: vcpu=%d mem=%dMiB forwards=%d",
 		spec.VCPU, spec.MemoryMiB, countForwards(spec))
 

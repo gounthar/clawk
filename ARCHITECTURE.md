@@ -105,8 +105,9 @@ because it pins a vendored `gvisor-tap-vsock` fork; everything clawk-specific
 |--|----|-------------|
 | Host | macOS (Apple silicon) | Linux |
 | Hypervisor | Virtualization.framework (cgo, Code-Hex/vz) | `firecracker` + `/dev/kvm` |
-| NIC | file-handle NIC speaking gvproxy's datagram protocol | host TAP, bridged to gvproxy by the frame pump |
-| Worktree | virtio-fs live mount (`/home/agent/workspace`) | baked into the rootfs at create (`/workspace`); host edits don't propagate |
+| NIC | file-handle NIC speaking gvproxy's datagram protocol | TAP, bridged to gvproxy by the frame pump |
+| Network devices | none on the host | bridge + 2 TAPs, in a per-sandbox unprivileged user+netns (rootless, default) or on the host via sudo (fallback) |
+| Worktree | virtio-fs live mount (`/home/agent/workspace`) | its own ext4 disk built in userspace, mounted at `/workspace`; host edits don't propagate |
 
 The split is `//go:build`-gated and total: a Linux checkout can't compile the vz
 code and vice versa. Most of clawk is shared; only the hypervisor glue is

@@ -10,9 +10,10 @@ import (
 )
 
 func main() {
-	// Privileged mount/umount re-exec path — runs before cobra because these
-	// hidden subcommands exist only for `sudo $self __loop-mount/-unmount`.
-	sandbox.InitRootHelpers()
+	// Network-namespace helper re-execs (rootless mode) — before cobra,
+	// because these are the clawk binary acting as its own helper, not CLI
+	// verbs, and they must not touch the config store or flag parsing.
+	sandbox.InitNetNSHelpers()
 	err := cli.Execute()
 	if err == nil {
 		return

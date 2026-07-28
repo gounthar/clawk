@@ -9,6 +9,35 @@ tagged.
 
 ### Added
 
+- **Linux firecracker sandboxes boot without sudo.** Each sandbox's network
+  now lives in its own unprivileged user + network namespace, where clawk has
+  `CAP_NET_ADMIN` over its own bridge and TAPs without asking the host for
+  anything — so a boot performs no privileged operation, and no clawk
+  interfaces appear on the host at all. gvproxy stays in the host namespace
+  (that is where its egress sockets belong); only the VM's NIC moves, which
+  also means the VM no longer sees host networking.
+
+  Hosts that forbid unprivileged user namespaces fall back to the previous
+  sudo-based bridge mode. `clawk doctor` reports which mode is active under
+  `host: network mode` and names the setting to change (on Ubuntu 24.04+,
+  AppArmor's `kernel.apparmor_restrict_unprivileged_userns`).
+  `CLAWK_NET_MODE=rootless|bridge` pins one.
+
+- **Release binaries no longer need a Go toolchain.** Booting a sandbox
+  compiled the three in-guest binaries on the host first, which made `go` a
+  hard prerequisite on every platform — `clawk doctor` failed without it — and
+  put a module download in the first-boot path. Release artifacts now embed
+  those binaries (`make guestbin`), so an installed clawk just unpacks them.
+  Building from source still compiles them on first boot, which is what a
+  contributor editing the guest sources wants; `doctor` reports the toolchain as
+  required only in that case. Costs ~7 MiB of binary size per artifact.
+
+- **Linux release binaries.** `linux/amd64` and `linux/arm64` tarballs are built
+  and published alongside the macOS one, so the firecracker provider no longer
+  requires building from source. Each artifact embeds the in-guest binaries for
+  its own architecture — guest arch always equals host arch, since hardware
+  virtualization can't cross architectures.
+
 - **`env ( … )` gains aliases, defaults, and literals.** Entries now use
   shell / docker-compose parameter-expansion syntax: `NAME = ${HOST}` aliases
   a differently-named host variable, `${HOST:-default}` / `${HOST-default}`
@@ -17,8 +46,49 @@ tagged.
   or quoted right-hand side (`EDITOR = vim`) sets a literal constant. Bare
   `NAME` passthrough is unchanged.
 
+### Changed
+
+- **The worktree rides in on its own disk instead of being copied into the
+  rootfs.** Staging it used to loop-mount the rootfs as root — six privileged
+  operations per boot, plus a `sudo clawk __loop-mount` helper that mounted
+  whatever it was told. It is now built as a separate ext4 disk in userspace
+  and mounted by the guest from `/dev/vdc`. Same semantics (host edits still
+  don't propagate into a running guest); no privilege, and the root mount
+  helper is gone.
+
 ### Fixed
 
+- **Two firecracker sandboxes can run at once.** Every guest NIC used the same
+  hardcoded MAC and every TAP hung off one shared host bridge, so two guests
+  claimed one L2 identity on one segment — the second sandbox logged an IPv6
+  duplicate-address error and the bridge's forwarding table decided which
+  guest received what. Guest MACs are now derived per VM and each sandbox gets
+  its own bridge (keyed on uid, so users don't share segments either).
+
+  **Upgrading:** every host device name now carries the invoking uid, TAPs
+  included. Sandboxes created by an earlier clawk have differently-named
+  devices, so the first `clawk up` after upgrading reports the expected device
+  as missing — `clawk down && clawk up` re-provisions it. The old devices are
+  no longer named by anything and outlive `clawk destroy`; remove them with
+  `sudo ip link del clawk<hash>` (they are listed by `ip link | grep clawk`).
+- **A worktree disk that fails to mount now fails the boot.** The guest logged
+  the error to its console and carried on, so a sandbox whose disk was
+  unreadable came up with an empty directory where the repo should be,
+  answered the agent, and reported success — an agent could then run a whole
+  session against nothing. Boots that would have been silently empty now stop
+  with `clawk-init: FATAL: mount /dev/vdc …` on the console.
+- **First-boot failures on Linux say what went wrong.** The network setup ran
+  inside the detached VM daemon, which has no terminal — so on a host where
+  sudo needs a password it could never succeed, and its error went to a log
+  the CLI then deleted during rollback, leaving only "agent did not become
+  ready". Setup moved to the CLI (one prompt, in front of you), `clawk doctor`
+  gained a check for it, and boot failures now quote the daemon log.
+  ([#9](https://github.com/clawkwork/clawk/issues/9))
+- **A snapshot no longer risks a corrupted filesystem on restore.** `clawk up`
+  re-materialized the rootfs on every boot, including boots that were about to
+  restore a suspend state onto it — pairing a saved memory image with a disk
+  that had just been reset. Disks are left alone when a restorable state is
+  present.
 - **Forwarded `env ( … )` vars now reach the agent user.** The generated
   `/etc/profile.d/99-clawk-env.sh` was written `0600 root:root`, so the
   agent's login shells silently skipped it and the variables never arrived.

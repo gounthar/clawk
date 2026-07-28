@@ -20,7 +20,7 @@ BIN ?= ./bin/clawk
 ENTITLEMENTS := clawk.entitlements
 UNAME_S := $(shell uname -s)
 
-.PHONY: install build sign test clean
+.PHONY: install build sign test clean guestbin clean-guestbin
 
 install:
 	go install ./cmd/clawk
@@ -47,5 +47,25 @@ endif
 test:
 	go test ./...
 
-clean:
+# Cross-compile the in-guest binaries into internal/agentembed/prebuilt/ so the
+# next `go build` embeds them and the resulting clawk needs no Go toolchain to
+# boot a sandbox. Release builds run this first; source builds skip it and
+# compile the guest binaries on first boot instead.
+#
+# GUEST_ARCH must match the architecture the artifact will RUN on: hardware
+# virtualization can't cross architectures, so an arm64 clawk only boots arm64
+# guests. Defaults to this machine's.
+GUEST_ARCH ?= $(shell go env GOARCH)
+
+guestbin:
+	go run ./internal/guestbuild/cmd/gen-prebuilt -arch $(GUEST_ARCH)
+
+# Drop the embedded payload, restoring a plain source build.
+clean-guestbin:
+	rm -f $(PREBUILT_DIR)/clawk-init $(PREBUILT_DIR)/clawk-pty-agent \
+	      $(PREBUILT_DIR)/clawk-time-sync $(PREBUILT_DIR)/manifest.json
+
+PREBUILT_DIR := internal/agentembed/prebuilt
+
+clean: clean-guestbin
 	rm -rf ./bin

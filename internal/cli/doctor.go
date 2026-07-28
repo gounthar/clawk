@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/clawkwork/clawk/internal/config"
+	"github.com/clawkwork/clawk/internal/guestbuild"
 	"github.com/clawkwork/clawk/internal/sandbox"
 	"github.com/clawkwork/clawk/internal/vsockclient"
 	"github.com/clawkwork/clawk/machine/oci"
@@ -111,6 +112,31 @@ func fail(name, detail, fix string) doctorCheck {
 	return doctorCheck{Name: name, Status: statusFail, Detail: detail, FixHint: fix}
 }
 
+// goToolchainCheck reports on the Go toolchain, which is a prerequisite only
+// for a clawk built from source.
+//
+// A release binary carries the in-guest binaries prebuilt, so it needs no
+// toolchain and no module download to boot a sandbox — reporting a missing
+// `go` as a failure there would send people installing something they don't
+// need. A source build compiles them on first boot, and then `go` really is
+// required.
+func goToolchainCheck() doctorCheck {
+	const name = "host: go toolchain"
+	_, err := exec.LookPath("go")
+	switch {
+	case err == nil:
+		return ok(name, "on PATH")
+	case guestbuild.Prebuilt(runtime.GOARCH):
+		return ok(name, "not needed — this build ships the guest agent prebuilt")
+	default:
+		return fail(name,
+			"not found on PATH — this clawk was built from source, so it compiles the "+
+				"guest init/agent on first boot",
+			"install from https://go.dev/dl or brew install go — or use a release binary, "+
+				"which ships them prebuilt")
+	}
+}
+
 // runDoctorChecks dispatches the right set of checks based on whether
 // a sandbox name resolved. Empty name → host-only.
 func runDoctorChecks(name string) []doctorCheck {
@@ -149,13 +175,7 @@ func hostChecks() []doctorCheck {
 		Detail: fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
 	})
 
-	if _, err := exec.LookPath("go"); err != nil {
-		results = append(results, fail("host: go toolchain",
-			"not found on PATH (builds the guest init/agent for image-based sandboxes)",
-			"install from https://go.dev/dl or brew install go"))
-	} else {
-		results = append(results, ok("host: go toolchain", "on PATH"))
-	}
+	results = append(results, goToolchainCheck())
 
 	root := clawkRoot()
 	if _, err := os.Stat(root); err != nil {

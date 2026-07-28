@@ -104,7 +104,9 @@ func TestConvert(t *testing.T) {
 	image := convertToImage(t, buildTar(t, []tarEntry{
 		// PAX global header noise, as emitted by BuildKit.
 		{name: "pax_global_header", typeflag: tar.TypeXGlobalHeader},
-		// Root entry — refers to the rootfs itself, must be skipped.
+		// Root entry — configures the image root rather than creating an
+		// entry (see TestConvertRootEntry). 0755 root:root is what OCI
+		// layers carry here, i.e. the writer's own default.
 		{name: "./", typeflag: tar.TypeDir, mode: 0o755},
 		// Out-of-order: child before its parent's own entry; the parent
 		// entry arrives later with a tighter mode and must win.
@@ -183,6 +185,65 @@ func TestConvertRejectsWhiteout(t *testing.T) {
 	err := Convert(tarBuf, nopSeeker{&sink})
 	require.Error(t, err, "Convert with whiteout entry should fail")
 	require.Contains(t, err.Error(), "whiteout", "Convert with whiteout entry: err = %v, want whiteout rejection", err)
+}
+
+// The tar entry naming the archive root ("./", "/", ".") carries the root
+// directory's own mode and ownership. The writer creates its root inode as
+// 0755 root:root, so ignoring that entry — as this converter used to — left
+// every mounted tree with a root the owner of its contents could not write in.
+//
+// This path is shared with every OCI rootfs build, not just clawk's worktree
+// disks, so the cases that must NOT be mistaken for the root matter as much as
+// the one that must: ".." escapes the archive, and only a directory can
+// describe a directory.
+func TestConvertRootEntry(t *testing.T) {
+	rootStat := func(t *testing.T, entries []tarEntry) string {
+		t.Helper()
+		image := convertToImage(t, buildTar(t, entries), Writable(), TotalSize(8<<20))
+		e2fsckClean(t, image)
+		return debugfsStat(t, image, "<2>") // inode 2 is the ext4 root
+	}
+
+	t.Run("root entry sets owner and mode", func(t *testing.T) {
+		out := rootStat(t, []tarEntry{
+			{name: "./", typeflag: tar.TypeDir, mode: 0o750, uid: 1000, gid: 1000},
+			{name: "./README.md", typeflag: tar.TypeReg, mode: 0o644, uid: 1000, gid: 1000, body: "hi\n"},
+		})
+		for _, want := range []string{"Type: directory", "Mode:  0750", "User:  1000", "Group:  1000"} {
+			require.Contains(t, out, want, "stat <2>:\n%s", out)
+		}
+	})
+
+	t.Run("children survive the root being reconfigured", func(t *testing.T) {
+		image := convertToImage(t, buildTar(t, []tarEntry{
+			{name: "./", typeflag: tar.TypeDir, mode: 0o750, uid: 1000, gid: 1000},
+			{name: "etc/hostname", typeflag: tar.TypeReg, mode: 0o644, body: "box\n"},
+		}), Writable(), TotalSize(8<<20))
+		e2fsckClean(t, image)
+		ls := debugfsCmd(t, image, "ls -l /")
+		// lost+found is created before the root entry is read; reusing the
+		// root inode must not drop the directory's existing entries.
+		require.Contains(t, ls, "lost+found", "ls /:\n%s", ls)
+		require.Contains(t, ls, "etc", "ls /:\n%s", ls)
+	})
+
+	t.Run("dotdot is an escape, not the root", func(t *testing.T) {
+		out := rootStat(t, []tarEntry{
+			{name: "..", typeflag: tar.TypeDir, mode: 0o700, uid: 4242, gid: 4242},
+			{name: "etc/hostname", typeflag: tar.TypeReg, mode: 0o644, body: "box\n"},
+		})
+		require.Contains(t, out, "Mode:  0755", "'..' must not reconfigure the root:\n%s", out)
+		require.NotContains(t, out, "User:  4242", "'..' must not reconfigure the root:\n%s", out)
+	})
+
+	t.Run("a non-directory naming the root is ignored", func(t *testing.T) {
+		out := rootStat(t, []tarEntry{
+			{name: ".", typeflag: tar.TypeReg, mode: 0o600, uid: 4242, gid: 4242, body: "nonsense"},
+			{name: "etc/hostname", typeflag: tar.TypeReg, mode: 0o644, body: "box\n"},
+		})
+		require.Contains(t, out, "Type: directory", "the root must stay a directory:\n%s", out)
+		require.Contains(t, out, "Mode:  0755", "stat <2>:\n%s", out)
+	})
 }
 
 // nopSeeker adapts a buffer for Convert's signature in error-path tests

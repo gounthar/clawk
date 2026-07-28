@@ -82,6 +82,11 @@ type mountSpec struct {
 	// host's kern.maxfiles. Tag is still the virtio-fs fallback. Kept in
 	// lock-step with internal/guestcfg.Mount.
 	NinePVSockPort uint32 `json:"ninep_port,omitempty"`
+	// Block, when set, mounts a local block device (FSType, default ext4)
+	// rather than any host-shared filesystem — how firecracker carries the
+	// worktree, having neither virtio-fs nor 9p. Takes precedence over both.
+	Block  string `json:"block,omitempty"`
+	FSType string `json:"fstype,omitempty"`
 }
 
 type fileSpec struct {
@@ -139,9 +144,21 @@ func main() {
 	}
 
 	for _, mt := range m.Mounts {
-		if err := mountShare(mt, m.User); err != nil {
-			logf("mount %s -> %s: %v", mt.Tag, mt.Path, err)
+		err := mountShare(mt, m.User)
+		if err == nil {
+			continue
 		}
+		// A block share IS the workspace — firecracker carries the worktree on
+		// its own disk, with no host transport to fall back to — so a failed
+		// mount here must stop the boot. Logging and carrying on brings the VM
+		// up with an empty directory where the repo should be, the agent
+		// answers, `clawk up` reports success, and a whole session runs against
+		// nothing. Host-shared mounts are the opposite case: a toolchain cache
+		// that didn't mount makes the sandbox slow, not wrong.
+		if mt.Block != "" {
+			fatalf("mount %s on %s: %v", mt.Block, mt.Path, err)
+		}
+		logf("mount %s -> %s: %v", mt.Tag, mt.Path, err)
 	}
 
 	for _, f := range m.Files {
@@ -645,6 +662,21 @@ func mountShare(mt mountSpec, u *manifestUser) error {
 	var flags uintptr
 	if mt.ReadOnly {
 		flags |= unix.MS_RDONLY
+	}
+
+	// A local block device needs no host transport at all, so it is tried
+	// first and never falls back: if the disk the host built for us won't
+	// mount, silently mounting something else would hide the workspace.
+	if mt.Block != "" {
+		fstype := mt.FSType
+		if fstype == "" {
+			fstype = "ext4"
+		}
+		if err := unix.Mount(mt.Block, mt.Path, fstype, flags, ""); err != nil {
+			return fmt.Errorf("mount %s (%s) on %s: %w", mt.Block, fstype, mt.Path, err)
+		}
+		logf("mounted %s (%s) on %s", mt.Block, fstype, mt.Path)
+		return nil
 	}
 
 	if mt.NinePVSockPort > 0 {
