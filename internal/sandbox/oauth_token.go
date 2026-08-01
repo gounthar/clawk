@@ -133,9 +133,9 @@ func ClearOAuthToken(clawkRootDir string) error {
 // fresh sandboxes drop the user straight into the agent without an
 // interactive setup dance:
 //
-//   - hasCompletedOnboarding: bypasses the theme + auth wizard. Only
-//     useful when CLAUDE_CODE_OAUTH_TOKEN is in play; the keychain
-//     path carries its own account metadata.
+//   - hasCompletedOnboarding: bypasses the theme + auth wizard. Needed
+//     by BOTH auth paths — the wizard's login step fires on the flag
+//     alone and never checks whether usable credentials already exist.
 //     See anthropics/claude-code#8938, #4714.
 //
 //   - projects[<path>].hasTrustDialogAccepted: bypasses the
@@ -152,8 +152,14 @@ const guestClaudeJSONPath = GuestHome + "/.claude.json"
 // ClaudeJSONMarkerFile returns the HostFile that
 // pre-creates ~/.claude.json. Two concerns share the file:
 //
-//   - hasCompletedOnboarding (only when hasToken — the keychain
-//     credentials path doesn't need it).
+//   - hasCompletedOnboarding, whenever the sandbox boots with usable
+//     credentials (hasAuth) — either a long-lived token or a seeded
+//     .credentials.json. ~/.claude.json lives on the per-boot
+//     disposable rootfs, so this marker IS the file claude reads at
+//     every startup; without the flag it re-runs the first-run wizard
+//     — including its OAuth step, which fires on the flag alone and
+//     never looks at the credentials sitting in ~/.claude/. The agent
+//     is asked to log in on every boot despite valid credentials.
 //   - hasTrustDialogAccepted=true for every phase worktree path the
 //     sandbox mounts, the per-repo source mounts those worktrees
 //     point at, and the workspace root. Without these, a fresh
@@ -161,12 +167,16 @@ const guestClaudeJSONPath = GuestHome + "/.claude.json"
 //     launch in each directory — a 100% pointless gate in a VM whose
 //     only contents the user just chose to mount.
 //
+// hasAuth=false leaves the flag off deliberately: with no credentials
+// to skip to, suppressing the wizard would strand the agent in a REPL
+// it can't authenticate from. The wizard's login step is the way out.
+//
 // Always emitted: the trust block is sandbox-shape-dependent (we
 // only know the paths after PrepareVM resolves phases), but it's
 // always wanted.
-func ClaudeJSONMarkerFile(phases []config.Phase, hasToken bool) HostFile {
+func ClaudeJSONMarkerFile(phases []config.Phase, hasAuth bool) HostFile {
 	doc := map[string]any{}
-	if hasToken {
+	if hasAuth {
 		doc["hasCompletedOnboarding"] = true
 	}
 
