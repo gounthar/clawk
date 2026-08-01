@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/clawkwork/clawk/internal/config"
+	"github.com/clawkwork/clawk/internal/guestcfg"
 	"github.com/stretchr/testify/require"
 )
 
@@ -218,17 +219,95 @@ func TestClaudeJSONMarkerFilePreTrustsPhases(t *testing.T) {
 	}
 }
 
-// TestClaudeJSONMarkerFileOmitsOnboardingWithoutToken keeps the
-// "onboarding marker is scoped to the token path" property — the
-// keychain-credentials flow ships its own account metadata.
-func TestClaudeJSONMarkerFileOmitsOnboardingWithoutToken(t *testing.T) {
+// TestClaudeJSONMarkerFileOmitsOnboardingWithoutAuth keeps the flag off
+// for a sandbox that has no credentials at all: the first-run wizard's
+// login step is the only way such a sandbox can authenticate, so
+// suppressing it would strand the agent in a REPL it can't sign into.
+func TestClaudeJSONMarkerFileOmitsOnboardingWithoutAuth(t *testing.T) {
 	hf := ClaudeJSONMarkerFile(nil, false)
 	var doc map[string]any
 	require.NoErrorf(t, json.Unmarshal(hf.Content, &doc), "marker content not valid JSON")
 	if _, set := doc["hasCompletedOnboarding"]; set {
-		t.Error("hasCompletedOnboarding should be absent without a token " +
-			"(keychain creds carry their own account metadata)")
+		t.Error("hasCompletedOnboarding should be absent with no credentials — " +
+			"the login wizard is the sandbox's only way in")
 	}
+}
+
+// TestStateDirHasCredentials pins the predicate the marker keys off:
+// present only once .credentials.json is in the mounted state dir.
+func TestStateDirHasCredentials(t *testing.T) {
+	state := t.TempDir()
+	if StateDirHasCredentials(state) {
+		t.Error("empty state dir reported credentials")
+	}
+	if StateDirHasCredentials("") {
+		t.Error("opted-out state dir reported credentials")
+	}
+	require.NoError(t, os.MkdirAll(filepath.Join(state, "claude"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(state, "claude", ".credentials.json"), []byte(`{}`), 0o600))
+	if !StateDirHasCredentials(state) {
+		t.Error("seeded .credentials.json not detected")
+	}
+}
+
+// TestGuestManifestMarksOnboardingForCredentialsPath is the regression
+// test for clawkwork/clawk#8. ~/.claude.json lives on the per-boot
+// disposable rootfs, so this marker is the whole file claude reads at
+// startup: without the flag, a sandbox authenticated by seeded keychain
+// credentials re-runs the first-run wizard — and is asked to log in —
+// on every single boot.
+func TestGuestManifestMarksOnboardingForCredentialsPath(t *testing.T) {
+	clawkRoot := t.TempDir()
+	state := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	require.NoError(t, os.MkdirAll(filepath.Join(state, "claude"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(state, "claude", ".credentials.json"), []byte(`{}`), 0o600))
+
+	sb := &config.Sandbox{Name: "box", Image: "golang:1.25"}
+	m, err := OCIGuestManifest(sb, state, "", clawkRoot)
+	require.NoErrorf(t, err, "OCIGuestManifest")
+
+	doc := markerDocFromManifest(t, m)
+	if doc["hasCompletedOnboarding"] != true {
+		t.Errorf("hasCompletedOnboarding = %v, want true — seeded credentials "+
+			"are unreachable while the onboarding wizard runs", doc["hasCompletedOnboarding"])
+	}
+}
+
+// TestGuestManifestOmitsOnboardingWithoutAnyAuth is the other half of
+// the contract: no token, no credentials, no flag.
+func TestGuestManifestOmitsOnboardingWithoutAnyAuth(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+
+	sb := &config.Sandbox{Name: "box", Image: "golang:1.25"}
+	m, err := OCIGuestManifest(sb, t.TempDir(), "", t.TempDir())
+	require.NoErrorf(t, err, "OCIGuestManifest")
+
+	doc := markerDocFromManifest(t, m)
+	if _, set := doc["hasCompletedOnboarding"]; set {
+		t.Error("hasCompletedOnboarding set with neither token nor credentials")
+	}
+}
+
+// markerDocFromManifest returns the parsed ~/.claude.json the guest will
+// boot with, failing the test if the manifest doesn't carry one.
+func markerDocFromManifest(t *testing.T, m guestcfg.Manifest) map[string]any {
+	t.Helper()
+	for _, f := range m.Files {
+		if f.Path != guestClaudeJSONPath {
+			continue
+		}
+		var doc map[string]any
+		require.NoErrorf(t, json.Unmarshal(f.Content, &doc),
+			"marker content not valid JSON: %s", f.Content)
+		return doc
+	}
+	t.Fatalf("manifest has no %s file", guestClaudeJSONPath)
+	return nil
 }
 
 // TestSeedClaudeStateDirWritesSettings checks that the synthesized

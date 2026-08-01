@@ -169,8 +169,13 @@ func OCIGuestManifest(sb *config.Sandbox, stateDir, cacheDir, rootDir string) (g
 
 	// Snapshot files — the write_files: equivalent.
 	token, _ := LoadOAuthToken(rootDir)
+	// Both auth paths need the onboarding marker: a seeded
+	// .credentials.json is only reachable once claude skips its
+	// first-run wizard. SeedClaudeStateDir has already run by here
+	// (provider Create), so the state dir is authoritative.
+	hasAuth := token != "" || StateDirHasCredentials(stateDir)
 	files := append(DefaultHostFiles(rootDir), WorkspaceDocFile(sb))
-	files = append(files, ClaudeJSONMarkerFile(sb.Phases, token != ""))
+	files = append(files, ClaudeJSONMarkerFile(sb.Phases, hasAuth))
 	envFile, ok, err := EnvFile(sb)
 	if err != nil {
 		return guestcfg.Manifest{}, err

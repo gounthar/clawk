@@ -172,7 +172,7 @@ func SeedClaudeStateDir(stateRoot, clawkRootDir string) error {
 	if token, _ := LoadOAuthToken(clawkRootDir); token != "" {
 		return nil
 	}
-	credPath := filepath.Join(dst, ".credentials.json")
+	credPath := claudeCredentialsPath(stateRoot)
 	if _, err := os.Stat(credPath); err == nil {
 		// Already persisted — claude has been refreshing in-place; don't
 		// clobber a fresher copy with a stale keychain snapshot.
@@ -184,6 +184,30 @@ func SeedClaudeStateDir(stateRoot, clawkRootDir string) error {
 		}
 	}
 	return nil
+}
+
+// claudeCredentialsPath is where claude reads and refreshes its OAuth
+// credentials, in host terms: inside the per-sandbox state dir that
+// PersistentClaudeShares mounts at ~/.claude/.
+func claudeCredentialsPath(stateRoot string) string {
+	return filepath.Join(stateRoot, "claude", ".credentials.json")
+}
+
+// StateDirHasCredentials reports whether the sandbox will boot with
+// keychain-path credentials in place — either just seeded by
+// SeedClaudeStateDir or persisted (and refreshed) by a previous session.
+//
+// Callers use it to decide the onboarding marker: credentials are only
+// usable if claude skips its first-run wizard, and the wizard's login
+// step never checks for them (see ClaudeJSONMarkerFile). Runs after
+// SeedClaudeStateDir in every boot path, so a first boot sees the file
+// the seed just wrote.
+func StateDirHasCredentials(stateRoot string) bool {
+	if stateRoot == "" {
+		return false
+	}
+	_, err := os.Stat(claudeCredentialsPath(stateRoot))
+	return err == nil
 }
 
 // SeedClaudeMemory writes seed into the agent's auto-memory entrypoint
