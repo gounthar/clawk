@@ -361,9 +361,19 @@ var DefaultAllowedDomains = []string{
 	"*.snapcraftcontent.com", // the CDN snap redirects to for actual .snap downloads
 }
 
-// PortForward maps a host port to a guest port so services running in the VM
-// are reachable from the host (e.g., dev servers). Applied at VM start time;
-// changes require an `up` cycle to take effect.
+// PortForward maps a host port to a guest port. It expresses both forwarding
+// directions; which one applies depends on the field it is stored in.
+//
+//   - Sandbox.Forwards (outbound): host 127.0.0.1:HostPort → guest GuestPort,
+//     served by gvproxy. Applied at VM start time; changes require an `up`
+//     cycle to take effect.
+//   - Sandbox.ReverseForwards (inbound): guest 127.0.0.1:GuestPort → host
+//     127.0.0.1:HostPort, tunnelled over vsock (see internal/revfwd).
+//     Applied live to a running sandbox.
+//
+// The HostPort:GuestPort spelling is deliberately the same in both — a spec
+// always reads "this host port, that guest port", so `3000:80` maps the same
+// pair of ports whichever direction is being configured.
 type PortForward struct {
 	HostPort  int `json:"host_port"`
 	GuestPort int `json:"guest_port"`
@@ -435,6 +445,12 @@ type Sandbox struct {
 	Phases       []Phase       `json:"phases"`
 	Network      NetworkPolicy `json:"network"`
 	Forwards     []PortForward `json:"forwards,omitempty"`
+	// ReverseForwards are host loopback services exposed on the guest's
+	// own loopback — the inbound counterpart of Forwards. Unlike Forwards
+	// (a gvproxy binding fixed at VM start) these are tunnelled over vsock
+	// by the daemon, so edits apply to a running sandbox. See
+	// internal/revfwd.
+	ReverseForwards []PortForward `json:"reverse_forwards,omitempty"`
 	// Files is the list of host->guest file copies refreshed on every
 	// `clawk up`. See HostFile. Empty = no snapshots.
 	Files []HostFile `json:"files,omitempty"`

@@ -18,6 +18,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -623,6 +624,14 @@ func main() {
 	// back to giving the guest its full ceiling.
 	go runMemReporter(logger)
 
+	// Reverse port forwarder: holds a control connection to the host,
+	// binds 127.0.0.1:<port> in here for every reverse forward the host
+	// publishes, and tunnels each connection back over vsock. Idle unless
+	// the sandbox has reverse forwards configured; retries forever if the
+	// host end isn't there (firecracker, or a host that hasn't started its
+	// proxy yet).
+	go runReverseForwarder(logger)
+
 	var wg sync.WaitGroup
 	for {
 		conn, err := listener.Accept()
@@ -714,6 +723,269 @@ func forwardSSHAgent(guest net.Conn, logger *log.Logger) {
 	go func() { _, _ = io.Copy(host, guest); done <- struct{}{} }()
 	go func() { _, _ = io.Copy(guest, host); done <- struct{}{} }()
 	<-done
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Reverse port forwarding
+//
+// The mirror image of `clawk forward add`: a service on the host's
+// 127.0.0.1 made reachable at 127.0.0.1 in here. gvproxy can't do it —
+// loopback in the guest is the guest's own — so we bind the port locally
+// and tunnel each connection to the host over vsock.
+//
+// Wire protocol kept in lock-step with internal/revfwd in the parent repo;
+// any change there must be mirrored here. Two connection kinds, both
+// guest-initiated, both starting with one JSON greeting line:
+//
+//	op=control   the host answers with the full forward set now and again
+//	             on every change, so `clawk forward add-reverse` applies to
+//	             a running sandbox.
+//	op=connect   the host validates the requested port, answers ok, then
+//	             pipes bytes to 127.0.0.1:<port> on the Mac.
+// ────────────────────────────────────────────────────────────────────────
+
+const (
+	// reverseForwardVSockPort is the host-side port serving both kinds.
+	// Mirrors revfwd.VSockPort. Distinct from the pty agent (1024),
+	// time-sync (1025), ssh-agent (1026), and mem-report (1027).
+	reverseForwardVSockPort = 1028
+
+	// reverseForwardProtoVersion mirrors revfwd.ProtoVersion.
+	reverseForwardProtoVersion = 1
+
+	// reverseForwardMaxLine mirrors revfwd.MaxLineBytes.
+	reverseForwardMaxLine = 64 * 1024
+
+	// reverseForwardMinBackoff / reverseForwardMaxBackoff bound the retry
+	// delay when the host end isn't answering. It legitimately isn't for
+	// the first moments of every boot (the daemon starts its proxy after
+	// the VM is up) and permanently under firecracker, whose vsock is
+	// one-way — so this loop has to be patient without being chatty.
+	reverseForwardMinBackoff = 1 * time.Second
+	reverseForwardMaxBackoff = 30 * time.Second
+
+	// reverseForwardStableSession is how long a control connection must
+	// last to count as healthy and reset the backoff. Shorter than that
+	// and we treat it as a failed attempt, so a host that accepts and
+	// immediately hangs up can't put us in a tight redial loop.
+	reverseForwardStableSession = 30 * time.Second
+)
+
+type revfwdGreeting struct {
+	Op   string `json:"op"`
+	V    int    `json:"v"`
+	Port int    `json:"port,omitempty"`
+}
+
+type revfwdSnapshot struct {
+	Forwards []revfwdForward `json:"forwards"`
+}
+
+type revfwdForward struct {
+	GuestPort int `json:"guest"`
+	HostPort  int `json:"host"`
+}
+
+type revfwdReply struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+// reverseForwarder owns the guest-side listeners, keyed by the guest port
+// each is bound to.
+type reverseForwarder struct {
+	log *log.Logger
+
+	mu        sync.Mutex
+	listeners map[int]*reverseListener
+}
+
+type reverseListener struct {
+	hostPort int
+	ln       net.Listener
+}
+
+// runReverseForwarder keeps the control connection to the host alive,
+// applying every set the host publishes. Never returns.
+func runReverseForwarder(logger *log.Logger) {
+	f := &reverseForwarder{log: logger, listeners: make(map[int]*reverseListener)}
+	backoff := reverseForwardMinBackoff
+	quiet := false
+	for {
+		start := time.Now()
+		err := f.controlSession()
+		// Every listener exists to serve connections through the host, so
+		// once the host is gone they must go too: a port left bound would
+		// accept a client and then fail it, which reads as a broken service
+		// rather than an absent one.
+		f.apply(nil)
+
+		if time.Since(start) >= reverseForwardStableSession {
+			backoff, quiet = reverseForwardMinBackoff, false
+		}
+		if err != nil && !quiet {
+			logger.Printf("reverse-forward: %v (retrying, quietly from here)", err)
+			quiet = true
+		}
+		time.Sleep(backoff)
+		if backoff *= 2; backoff > reverseForwardMaxBackoff {
+			backoff = reverseForwardMaxBackoff
+		}
+	}
+}
+
+// controlSession dials the host and applies snapshots until the connection
+// drops. A clean EOF (the host shutting down) returns nil.
+func (f *reverseForwarder) controlSession() error {
+	conn, err := vsock.Dial(vsockHostCID, reverseForwardVSockPort, nil)
+	if err != nil {
+		return fmt.Errorf("vsock dial host:%d: %w", reverseForwardVSockPort, err)
+	}
+	defer conn.Close()
+
+	if err := revfwdWriteLine(conn, revfwdGreeting{
+		Op: "control", V: reverseForwardProtoVersion,
+	}); err != nil {
+		return fmt.Errorf("sending control greeting: %w", err)
+	}
+	r := bufio.NewReaderSize(conn, reverseForwardMaxLine)
+	for {
+		var snap revfwdSnapshot
+		if err := revfwdReadLine(r, &snap); err != nil {
+			if errors.Is(err, io.EOF) || isClosedConn(err) {
+				return nil
+			}
+			return fmt.Errorf("reading forward set: %w", err)
+		}
+		f.apply(snap.Forwards)
+	}
+}
+
+// apply reconciles the bound listeners with want, which is always the
+// complete desired set. Listeners whose host port changed are rebound;
+// ports that fail to bind are logged and retried on the next snapshot.
+func (f *reverseForwarder) apply(want []revfwdForward) {
+	desired := make(map[int]int, len(want)) // guest port -> host port
+	for _, fw := range want {
+		if !validPort(fw.GuestPort) || !validPort(fw.HostPort) {
+			f.log.Printf("reverse-forward: ignoring out-of-range mapping %d -> %d",
+				fw.GuestPort, fw.HostPort)
+			continue
+		}
+		desired[fw.GuestPort] = fw.HostPort
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for guestPort, l := range f.listeners {
+		if hostPort, ok := desired[guestPort]; ok && hostPort == l.hostPort {
+			continue
+		}
+		_ = l.ln.Close()
+		delete(f.listeners, guestPort)
+	}
+	for guestPort, hostPort := range desired {
+		if _, ok := f.listeners[guestPort]; ok {
+			continue
+		}
+		// 127.0.0.1 rather than 0.0.0.0 on purpose: the point is to make
+		// the host service look local, and binding the guest's routable
+		// interface would re-export it to whatever else can reach the VM.
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", guestPort))
+		if err != nil {
+			f.log.Printf("reverse-forward: bind 127.0.0.1:%d: %v", guestPort, err)
+			continue
+		}
+		l := &reverseListener{hostPort: hostPort, ln: ln}
+		f.listeners[guestPort] = l
+		f.log.Printf("reverse-forward: 127.0.0.1:%d -> host 127.0.0.1:%d", guestPort, hostPort)
+		go f.acceptLoop(l)
+	}
+}
+
+func (f *reverseForwarder) acceptLoop(l *reverseListener) {
+	for {
+		conn, err := l.ln.Accept()
+		if err != nil {
+			// Closed is the normal path: apply() dropped this forward.
+			if !errors.Is(err, net.ErrClosed) {
+				f.log.Printf("reverse-forward: accept: %v", err)
+			}
+			return
+		}
+		go f.forward(conn, l.hostPort)
+	}
+}
+
+// forward bridges one guest-local connection to the host service behind
+// hostPort.
+func (f *reverseForwarder) forward(local net.Conn, hostPort int) {
+	defer local.Close()
+
+	host, err := vsock.Dial(vsockHostCID, reverseForwardVSockPort, nil)
+	if err != nil {
+		f.log.Printf("reverse-forward: vsock dial host:%d: %v", reverseForwardVSockPort, err)
+		return
+	}
+	defer host.Close()
+
+	if err := revfwdWriteLine(host, revfwdGreeting{
+		Op: "connect", V: reverseForwardProtoVersion, Port: hostPort,
+	}); err != nil {
+		f.log.Printf("reverse-forward: sending connect greeting: %v", err)
+		return
+	}
+	r := bufio.NewReaderSize(host, reverseForwardMaxLine)
+	var reply revfwdReply
+	if err := revfwdReadLine(r, &reply); err != nil {
+		f.log.Printf("reverse-forward: reading connect reply: %v", err)
+		return
+	}
+	if !reply.OK {
+		f.log.Printf("reverse-forward: host refused port %d: %s", hostPort, reply.Error)
+		return
+	}
+
+	// Read the host side through r, not host: the reply reader may already
+	// hold bytes the service sent immediately after the handshake.
+	//
+	// First direction to end tears down both — the host's vsock conn has no
+	// CloseWrite (vz's *VirtioSocketConnection doesn't implement it), so a
+	// half-close would never reach this end. Same shape as
+	// forwardSSHAgent above.
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(host, local); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(local, r); done <- struct{}{} }()
+	<-done
+}
+
+func validPort(p int) bool { return p >= 1 && p <= 65535 }
+
+// revfwdWriteLine mirrors revfwd.WriteLine.
+func revfwdWriteLine(w io.Writer, v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	if len(b)+1 > reverseForwardMaxLine {
+		return errors.New("control line too long")
+	}
+	_, err = w.Write(append(b, '\n'))
+	return err
+}
+
+// revfwdReadLine mirrors revfwd.ReadLine. The reader must be reused for any
+// payload that follows, or bytes buffered past the newline are lost.
+func revfwdReadLine(r *bufio.Reader, v any) error {
+	line, err := r.ReadSlice('\n')
+	if errors.Is(err, bufio.ErrBufferFull) {
+		return errors.New("control line too long")
+	}
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(line, v)
 }
 
 // ────────────────────────────────────────────────────────────────────────

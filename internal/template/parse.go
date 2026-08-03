@@ -98,7 +98,11 @@ type Template struct {
 	// block.
 	DenySources []string
 	Forwards    []string // port forward specs (PORT or HOST:GUEST)
-	Env         []string // env entries to export in the VM (canonical envspec form; see parseEnvBlock)
+	// ReverseForwards are the `reverse <spec>` entries of a forwards
+	// block: host loopback ports exposed on the guest's loopback. Same
+	// HOST:GUEST spelling as Forwards, opposite direction of travel.
+	ReverseForwards []string
+	Env             []string // env entries to export in the VM (canonical envspec form; see parseEnvBlock)
 
 	// Lifecycle hooks. Each is a list of shell commands run inside the
 	// VM at the named moment.
@@ -211,6 +215,7 @@ func (t *Template) Merge(over *Template) {
 	t.DenyIPs = append(t.DenyIPs, over.DenyIPs...)
 	t.Use = append(t.Use, over.Use...)
 	t.Forwards = append(t.Forwards, over.Forwards...)
+	t.ReverseForwards = append(t.ReverseForwards, over.ReverseForwards...)
 	t.Env = append(t.Env, over.Env...)
 	t.OnCreate = append(t.OnCreate, over.OnCreate...)
 	t.OnUp = append(t.OnUp, over.OnUp...)
@@ -299,7 +304,7 @@ func (p *parser) parseTemplateDirective(tmpl *Template, t Token) error {
 	case "on":
 		return p.parseOnDirective(tmpl)
 	case "forwards":
-		return p.parseIdentBlock(&tmpl.Forwards, "forwards")
+		return p.parseForwardsBlock(tmpl)
 	case "files":
 		return p.parseFilesBlock(tmpl)
 	case "shares":
@@ -395,6 +400,78 @@ func (p *parser) parseValidatedIdentBlock(dst *[]string, directive string, valid
 		*dst = append(*dst, t.Val)
 		p.advance()
 	}
+}
+
+// parseForwardsBlock parses a `forwards ( … )` block (or the inline
+// `forwards ENTRY` form). An entry is a port spec — `PORT` or
+// `HOST:GUEST` — optionally prefixed with `reverse`:
+//
+//	forwards (
+//	    3000            # guest 3000 reachable at localhost:3000 on the host
+//	    8080:80         # guest 80   reachable at localhost:8080 on the host
+//	    reverse 63342   # the host's localhost:63342 reachable inside the guest
+//	)
+//
+// `reverse` is a modifier rather than its own top-level directive because
+// the two lists are the same thing pointed in opposite directions —
+// keeping them in one block is what makes the asymmetry visible.
+//
+// Specs are validated downstream (internal/cli parses them into
+// config.PortForward), same as before: this only sorts entries into the
+// two lists.
+func (p *parser) parseForwardsBlock(tmpl *Template) error {
+	p.advance() // consume "forwards"
+	t := p.peek()
+
+	// Inline form: `forwards ENTRY` / `forwards reverse ENTRY`
+	if t.Kind == TokIdent {
+		if err := p.parseForwardEntry(tmpl); err != nil {
+			return err
+		}
+		return p.expectNewlineOrEOF()
+	}
+
+	if t.Kind != TokLParen {
+		return p.errorAt(t, "expected '(' or identifier after %q, got %s", "forwards", t)
+	}
+	p.advance()
+	for {
+		p.skipNewlines()
+		if t := p.peek(); t.Kind == TokRParen {
+			p.advance()
+			return p.expectNewlineOrEOF()
+		} else if t.Kind != TokIdent {
+			return p.errorAt(t, "expected entry or ')' in %q, got %s", "forwards", t)
+		}
+		if err := p.parseForwardEntry(tmpl); err != nil {
+			return err
+		}
+	}
+}
+
+// parseForwardEntry consumes one forwards entry, with the current token
+// already known to be a TokIdent.
+func (p *parser) parseForwardEntry(tmpl *Template) error {
+	t := p.peek()
+	if t.Val != "reverse" {
+		if isKeyword(t.Val) {
+			return p.errorAt(t, "unexpected keyword %q in %q", t.Val, "forwards")
+		}
+		tmpl.Forwards = append(tmpl.Forwards, t.Val)
+		p.advance()
+		return nil
+	}
+	p.advance() // consume "reverse"
+	// The spec must follow on the same line; a newline token here means
+	// the user wrote a bare `reverse`, which we reject rather than
+	// silently swallowing the next entry.
+	spec := p.peek()
+	if spec.Kind != TokIdent || isKeyword(spec.Val) {
+		return p.errorAt(spec, "expected a port spec after 'reverse', got %s", spec)
+	}
+	tmpl.ReverseForwards = append(tmpl.ReverseForwards, spec.Val)
+	p.advance()
+	return nil
 }
 
 // parseEnvBlock parses an `env ( … )` block (or the inline `env ENTRY`

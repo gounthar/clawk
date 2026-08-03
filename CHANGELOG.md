@@ -9,6 +9,27 @@ tagged.
 
 ### Added
 
+- **Reverse port forwarding: host loopback services, reachable in the guest.**
+  `clawk forward add-reverse <sandbox> 63342` makes whatever is bound to
+  `127.0.0.1:63342` on your Mac answer at the same address inside the sandbox
+  (`5432:15432` maps across ports, host-side first, same as `forward add`).
+  Allow-listing couldn't do this — `127.0.0.1` in the guest is the guest's own
+  loopback — so the guest agent binds the port and tunnels each connection to
+  the daemon over vsock, which dials the host service. Only the ports you list
+  are reachable; the rest of your loopback isn't.
+
+  Unlike outbound forwards these apply to a running sandbox immediately, which
+  matters for the case that motivated it: the Claude Code IDE plugins
+  advertise a per-window websocket port in `~/.claude/ide/<port>.lock`, so
+  reconnecting after an IDE restart is one `add-reverse`, not a VM cycle.
+  Share `~/.claude/ide` into the guest and `/ide` works from inside the
+  sandbox — recipe in [docs/networking.md](docs/networking.md#recipe-the-claude-code-ide-plugin).
+
+  Declarable in `clawk.mod` as a `reverse` entry inside `forwards ( … )`.
+  `clawk status` and `forward list --json` show both directions. vz only:
+  firecracker's vsock is one-way, and the CLI says so rather than silently
+  doing nothing.
+
 - **Linux firecracker sandboxes boot without sudo.** Each sandbox's network
   now lives in its own unprivileged user + network namespace, where clawk has
   `CAP_NET_ADMIN` over its own bridge and TAPs without asking the host for

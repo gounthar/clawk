@@ -117,6 +117,36 @@ func TestParseForwards(t *testing.T) {
 	}
 }
 
+// TestParseReverseForwards: `reverse` inside a forwards block sorts the
+// entry into the inbound list, leaving plain entries where they were.
+func TestParseReverseForwards(t *testing.T) {
+	src := `forwards (
+    3000
+    reverse 63342
+    reverse 5432:15432
+    8080:80
+)
+`
+	tmpl, err := parseBody(src)
+	require.NoError(t, err)
+	require.Equal(t, []string{"3000", "8080:80"}, tmpl.Forwards)
+	require.Equal(t, []string{"63342", "5432:15432"}, tmpl.ReverseForwards)
+}
+
+func TestParseReverseForwardInline(t *testing.T) {
+	tmpl, err := parseBody("forwards reverse 63342\n")
+	require.NoError(t, err)
+	require.Empty(t, tmpl.Forwards)
+	require.Equal(t, []string{"63342"}, tmpl.ReverseForwards)
+}
+
+// A bare `reverse` must not silently swallow the next entry.
+func TestParseReverseForwardNeedsSpec(t *testing.T) {
+	_, err := parseBody("forwards (\n    reverse\n    3000\n)\n")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "expected a port spec after 'reverse'")
+}
+
 // TestParseInlineForms checks the go.mod-style syntax where single-entry
 // directives can be written without parentheses — `forwards 3000` is
 // equivalent to `forwards ( 3000 )`. Multi-entry directives still need the

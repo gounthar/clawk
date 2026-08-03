@@ -180,7 +180,7 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	var forwardSpecs []string
+	var forwardSpecs, reverseForwardSpecs []string
 	var onUp, onCreate []string
 	var requiredEnv []string
 	var instructions []string
@@ -189,6 +189,7 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 	var shareSources []shareSource
 	if clawkfile != nil {
 		forwardSpecs = append(forwardSpecs, clawkfile.Forwards...)
+		reverseForwardSpecs = append(reverseForwardSpecs, clawkfile.ReverseForwards...)
 		onUp = append(onUp, clawkfile.OnUp...)
 		onCreate = append(onCreate, clawkfile.OnCreate...)
 		requiredEnv = append(requiredEnv, clawkfile.Env...)
@@ -211,6 +212,10 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 	}
 
 	forwards, err := parseForwardSpecs(forwardSpecs, cwd)
+	if err != nil {
+		return nil, false, err
+	}
+	reverseForwards, err := parseReverseForwardSpecs(reverseForwardSpecs, cwd)
 	if err != nil {
 		return nil, false, err
 	}
@@ -249,24 +254,25 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 	memoryMiB, memoryMaxMiB = normalizeMemory(memoryMiB, memoryMaxMiB)
 
 	sb := &config.Sandbox{
-		Name:         name,
-		Provider:     provider,
-		GuestABI:     sandbox.CurrentGuestABI,
-		Namespace:    config.DefaultNamespace, // Phase 2: from clawk.mod / -n
-		Anchor:       cwd,
-		VMState:      config.VMStateStopped,
-		Network:      network,
-		Forwards:     forwards,
-		Files:        files,
-		Shares:       shares,
-		RequiredEnv:  requiredEnv,
-		Instructions: instructions,
-		Memory:       memory,
-		NestedVirt:   nested,
-		CPU:          cpu,
-		MemoryMiB:    memoryMiB,
-		MemoryMaxMiB: memoryMaxMiB,
-		DiskMiB:      diskMiB,
+		Name:            name,
+		Provider:        provider,
+		GuestABI:        sandbox.CurrentGuestABI,
+		Namespace:       config.DefaultNamespace, // Phase 2: from clawk.mod / -n
+		Anchor:          cwd,
+		VMState:         config.VMStateStopped,
+		Network:         network,
+		Forwards:        forwards,
+		ReverseForwards: reverseForwards,
+		Files:           files,
+		Shares:          shares,
+		RequiredEnv:     requiredEnv,
+		Instructions:    instructions,
+		Memory:          memory,
+		NestedVirt:      nested,
+		CPU:             cpu,
+		MemoryMiB:       memoryMiB,
+		MemoryMaxMiB:    memoryMaxMiB,
+		DiskMiB:         diskMiB,
 		// IdleTimeoutSec rides the same snapshot-at-create rule as every
 		// other clawk.mod value; it was the one vm(...) field this path
 		// forgot to copy when idle-stop landed, which silently pinned every
@@ -317,6 +323,23 @@ func loadHereClawkfile(cwd string) (*template.Template, []template.PolicyDef) {
 // config.PortForwards. context is the directory the specs came from —
 // used only for error messages.
 func parseForwardSpecs(specs []string, context string) ([]config.PortForward, error) {
+	return parseDirectedForwardSpecs(specs, context, "forward",
+		func(f config.PortForward) int { return f.HostPort })
+}
+
+// parseReverseForwardSpecs is parseForwardSpecs for the inbound direction.
+// Duplicates are keyed on the guest port, since that's the end that binds.
+func parseReverseForwardSpecs(specs []string, context string) ([]config.PortForward, error) {
+	return parseDirectedForwardSpecs(specs, context, "reverse forward",
+		func(f config.PortForward) int { return f.GuestPort })
+}
+
+// parseDirectedForwardSpecs parses specs, dropping later duplicates of an
+// already-bound port. Single-source (one clawk.mod), so a repeat is the
+// same file saying it twice — dedup silently rather than erroring the way
+// the multi-source workspace path does.
+func parseDirectedForwardSpecs(specs []string, context, kind string,
+	bound func(config.PortForward) int) ([]config.PortForward, error) {
 	if len(specs) == 0 {
 		return nil, nil
 	}
@@ -325,12 +348,12 @@ func parseForwardSpecs(specs []string, context string) ([]config.PortForward, er
 	for _, s := range specs {
 		fwd, err := parsePortSpec(s)
 		if err != nil {
-			return nil, fmt.Errorf("%s forward %q: %w", context, s, err)
+			return nil, fmt.Errorf("%s %s %q: %w", context, kind, s, err)
 		}
-		if seen[fwd.HostPort] {
+		if seen[bound(fwd)] {
 			continue
 		}
-		seen[fwd.HostPort] = true
+		seen[bound(fwd)] = true
 		out = append(out, fwd)
 	}
 	return out, nil

@@ -241,7 +241,8 @@ func SeedClaudeMemory(stateRoot, seed string) error {
 // NinepBasePort is the first guest vsock port used by the host 9p cache
 // servers; each ToolchainCacheShares entry gets NinepBasePort+index. Chosen
 // clear of the fixed control ports (1024 pty-agent, 1025 time-sync, 1026
-// ssh-agent) with headroom so adding a cache never collides.
+// ssh-agent, 1027 mem-report, 1028 reverse-forward) with headroom so adding
+// a cache never collides.
 const NinepBasePort uint32 = 1100
 
 // ToolchainCachesEnabled gates ToolchainCacheShares. It is false: every

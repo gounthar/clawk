@@ -49,6 +49,7 @@ sandbox my-project (
     forwards (
         3000
         5432:5432
+        reverse 63342                    # the host's localhost:63342, inside the guest
     )
 
     files (
@@ -117,7 +118,11 @@ sandbox my-project (
 - `network ( … )` — egress policy: `allow` / `deny` a domain or `ip <addr>`,
   plus `use <policy>…` chains — see
   [Networking](networking.md#policies-and-use-chains).
-- `forwards ( … )` — port forwards (`PORT` or `HOST:GUEST`).
+- `forwards ( … )` — port forwards (`PORT` or `HOST:GUEST`). An entry
+  prefixed with `reverse` points the other way: a service on the host's
+  `127.0.0.1` becomes reachable at the same address inside the guest. Same
+  host-first spelling either way — see
+  [Networking](networking.md#reverse-forwarding-host-loopback--guest).
 - `env ( … )` — environment variables to export inside the VM. Secret
   *values* come from your shell at boot and are never written to disk on the
   host; only names, defaults, and literals live in the file. Each entry uses

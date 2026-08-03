@@ -341,6 +341,10 @@ func loadOrCreateSandboxFromWorkspace(name string, ws *template.Workspace) (*con
 	if err != nil {
 		return nil, err
 	}
+	reverseForwards, err := mergeReverseForwards(ws)
+	if err != nil {
+		return nil, err
+	}
 
 	files, err := mergeFiles(ws)
 	if err != nil {
@@ -383,24 +387,25 @@ func loadOrCreateSandboxFromWorkspace(name string, ws *template.Workspace) (*con
 	}
 
 	sb := &config.Sandbox{
-		Name:           name,
-		Provider:       provider,
-		GuestABI:       sandbox.CurrentGuestABI,
-		Profile:        runProfile,
-		Namespace:      createNamespace(),
-		VMState:        config.VMStateStopped,
-		Network:        network,
-		Forwards:       forwards,
-		Files:          files,
-		Shares:         shares,
-		NestedVirt:     nested,
-		CPU:            cpu,
-		MemoryMiB:      memoryMiB,
-		MemoryMaxMiB:   memoryMaxMiB,
-		DiskMiB:        disk,
-		IdleTimeoutSec: resolveIdleTimeout(ws),
-		Image:          image,
-		Kernel:         kernel,
+		Name:            name,
+		Provider:        provider,
+		GuestABI:        sandbox.CurrentGuestABI,
+		Profile:         runProfile,
+		Namespace:       createNamespace(),
+		VMState:         config.VMStateStopped,
+		Network:         network,
+		Forwards:        forwards,
+		ReverseForwards: reverseForwards,
+		Files:           files,
+		Shares:          shares,
+		NestedVirt:      nested,
+		CPU:             cpu,
+		MemoryMiB:       memoryMiB,
+		MemoryMaxMiB:    memoryMaxMiB,
+		DiskMiB:         disk,
+		IdleTimeoutSec:  resolveIdleTimeout(ws),
+		Image:           image,
+		Kernel:          kernel,
 		// Workspace-level `on up` / `on create` — run at the workspace root,
 		// distinct from the per-repo hooks addPhases folds into each Phase.
 		// Only a true workspace root (a block with includes) carries a
@@ -566,45 +571,75 @@ func resolveKernel(ws *template.Workspace) (string, error) {
 	return finalizeKernelRef(picked), nil
 }
 
-// mergeForwards gathers forward specs from the workspace and each repo's
-// Clawkfile, parses them, and errors on duplicate host ports with a message
-// naming both sources.
+// forwardSource is one port-forward spec plus where it came from, so a
+// conflict can name both contributors.
+type forwardSource struct {
+	Origin string // human-readable: "workspace" or a repo name
+	Spec   string
+}
+
+// mergeForwards gathers outbound forward specs from the workspace and each
+// repo's Clawkfile, parses them, and errors on duplicate host ports with a
+// message naming both sources.
 func mergeForwards(ws *template.Workspace) ([]config.PortForward, error) {
-	type src struct {
-		Origin string // human-readable: "workspace" or a repo name
-		Spec   string
-	}
-	var sources []src
-	for _, s := range ws.File.Forwards {
-		sources = append(sources, src{Origin: "workspace", Spec: s})
+	sources := collectForwardSpecs(ws, func(t *template.Template) []string { return t.Forwards })
+	// The host port is the one that gets bound, so it's the one that can
+	// only be claimed once.
+	return mergeForwardSources(sources, "forward", "host port",
+		func(f config.PortForward) int { return f.HostPort })
+}
+
+// mergeReverseForwards is mergeForwards for the inbound direction. The
+// uniqueness check moves to the guest port: that's the end doing the
+// binding, so two specs claiming it conflict even when their host ports
+// differ.
+func mergeReverseForwards(ws *template.Workspace) ([]config.PortForward, error) {
+	sources := collectForwardSpecs(ws, func(t *template.Template) []string { return t.ReverseForwards })
+	return mergeForwardSources(sources, "reverse forward", "guest port",
+		func(f config.PortForward) int { return f.GuestPort })
+}
+
+// collectForwardSpecs pulls one flavour of forward spec off the workspace
+// file and every repo Clawkfile, tagged with its origin.
+func collectForwardSpecs(ws *template.Workspace, pick func(*template.Template) []string) []forwardSource {
+	var sources []forwardSource
+	for _, s := range pick(ws.File) {
+		sources = append(sources, forwardSource{Origin: "workspace", Spec: s})
 	}
 	for _, r := range ws.Repos {
 		if r.Clawkfile == nil {
 			continue
 		}
-		for _, s := range r.Clawkfile.Forwards {
-			sources = append(sources, src{Origin: r.Name, Spec: s})
+		for _, s := range pick(r.Clawkfile) {
+			sources = append(sources, forwardSource{Origin: r.Name, Spec: s})
 		}
 	}
+	return sources
+}
 
-	byHostPort := make(map[int]src)
+// mergeForwardSources parses specs and rejects two sources claiming the
+// same bound port. kind and portName appear in the error; bound picks the
+// port that can only be claimed once for this direction.
+func mergeForwardSources(sources []forwardSource, kind, portName string,
+	bound func(config.PortForward) int) ([]config.PortForward, error) {
+	byPort := make(map[int]forwardSource)
 	var out []config.PortForward
 	for _, s := range sources {
 		fwd, err := parsePortSpec(s.Spec)
 		if err != nil {
-			return nil, fmt.Errorf("%s forward %q: %w", s.Origin, s.Spec, err)
+			return nil, fmt.Errorf("%s %s %q: %w", s.Origin, kind, s.Spec, err)
 		}
-		if prev, dup := byHostPort[fwd.HostPort]; dup {
+		if prev, dup := byPort[bound(fwd)]; dup {
 			// Allow identical specs from multiple sources (harmless); reject
-			// only genuine conflicts where the guest port differs.
+			// only genuine conflicts where the other port differs.
 			if fwd == mustParseSpec(prev.Spec) {
 				continue
 			}
 			return nil, fmt.Errorf(
-				"host port %d declared by both %s (%s) and %s (%s) — change one",
-				fwd.HostPort, prev.Origin, prev.Spec, s.Origin, s.Spec)
+				"%s %d declared by both %s (%s) and %s (%s) — change one",
+				portName, bound(fwd), prev.Origin, prev.Spec, s.Origin, s.Spec)
 		}
-		byHostPort[fwd.HostPort] = s
+		byPort[bound(fwd)] = s
 		out = append(out, fwd)
 	}
 	return out, nil
