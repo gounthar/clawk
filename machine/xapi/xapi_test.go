@@ -1,0 +1,282 @@
+package xapi
+
+import (
+	"context"
+	"errors"
+	"io"
+	"testing"
+
+	"github.com/clawkwork/clawk/machine"
+)
+
+// fakePool is an in-memory Client. It exists so the backend's lifecycle
+// logic can be developed and regression-tested with no hypervisor, no
+// network and no credentials — which is most of the backend, since the
+// interesting parts are ordering and state mapping rather than RPC.
+type fakePool struct {
+	power    map[VMRef]PowerState
+	nextVM   int
+	nextVDI  int
+	destroys []VMRef
+	// calls records the method sequence, so tests can assert ordering
+	// (e.g. that Destroy hard-shuts-down before VM.destroy).
+	calls []string
+}
+
+func newFakePool() *fakePool {
+	return &fakePool{power: map[VMRef]PowerState{}}
+}
+
+func (f *fakePool) log(name string) { f.calls = append(f.calls, name) }
+
+func (f *fakePool) VMCreate(_ context.Context, c VMConfig) (VMRef, error) {
+	f.log("VMCreate")
+	f.nextVM++
+	ref := VMRef(c.NameLabel)
+	f.power[ref] = PowerHalted
+	return ref, nil
+}
+
+func (f *fakePool) VMStart(_ context.Context, ref VMRef) error {
+	f.log("VMStart")
+	if f.power[ref] != PowerHalted && f.power[ref] != PowerSuspended {
+		return errors.New("fake: bad power state for start")
+	}
+	f.power[ref] = PowerRunning
+	return nil
+}
+
+func (f *fakePool) VMShutdown(_ context.Context, ref VMRef, graceful bool) error {
+	if graceful {
+		f.log("VMCleanShutdown")
+	} else {
+		f.log("VMHardShutdown")
+	}
+	f.power[ref] = PowerHalted
+	return nil
+}
+
+func (f *fakePool) VMDestroy(_ context.Context, ref VMRef) error {
+	f.log("VMDestroy")
+	f.destroys = append(f.destroys, ref)
+	delete(f.power, ref)
+	return nil
+}
+
+func (f *fakePool) VMPowerState(_ context.Context, ref VMRef) (PowerState, error) {
+	ps, ok := f.power[ref]
+	if !ok {
+		return "", errors.New("fake: no such VM")
+	}
+	return ps, nil
+}
+
+func (f *fakePool) VMPause(_ context.Context, ref VMRef) error {
+	f.log("VMPause")
+	f.power[ref] = PowerPaused
+	return nil
+}
+
+func (f *fakePool) VMUnpause(_ context.Context, ref VMRef) error {
+	f.log("VMUnpause")
+	f.power[ref] = PowerRunning
+	return nil
+}
+
+func (f *fakePool) VMSuspend(_ context.Context, ref VMRef) error {
+	f.log("VMSuspend")
+	f.power[ref] = PowerSuspended
+	return nil
+}
+
+func (f *fakePool) VMResumeFromSuspend(_ context.Context, ref VMRef) error {
+	f.log("VMResume")
+	f.power[ref] = PowerRunning
+	return nil
+}
+
+func (f *fakePool) VMCheckpoint(_ context.Context, ref VMRef, name string) (SnapshotRef, error) {
+	f.log("VMCheckpoint")
+	return SnapshotRef(name), nil
+}
+
+func (f *fakePool) VMGuestIP(context.Context, VMRef, string) (string, error) {
+	return "127.0.0.1", nil
+}
+
+func (f *fakePool) VDIImportRaw(_ context.Context, _, name string, r io.Reader, _ int64) (VDIRef, error) {
+	f.log("VDIImportRaw")
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		return "", err
+	}
+	f.nextVDI++
+	return VDIRef(name), nil
+}
+
+func (f *fakePool) VDIFindByName(context.Context, string, string) (VDIRef, bool, error) {
+	return "", false, nil
+}
+
+func (f *fakePool) VDIClone(_ context.Context, ref VDIRef) (VDIRef, error) {
+	f.log("VDIClone")
+	return ref + "-clone", nil
+}
+
+func (f *fakePool) VDIDestroy(context.Context, VDIRef) error { f.log("VDIDestroy"); return nil }
+
+func (f *fakePool) VBDAttach(context.Context, VMRef, VDIRef, string, bool) error {
+	f.log("VBDAttach")
+	return nil
+}
+
+func (f *fakePool) NetworkCreatePrivate(context.Context, string) (string, error) {
+	f.log("NetworkCreatePrivate")
+	return "net-fake", nil
+}
+
+func (f *fakePool) NetworkDestroy(context.Context, string) error {
+	f.log("NetworkDestroy")
+	return nil
+}
+
+func (f *fakePool) VIFAttach(context.Context, VMRef, string, string, string) error {
+	f.log("VIFAttach")
+	return nil
+}
+
+func (f *fakePool) Close() error { return nil }
+
+var _ Client = (*fakePool)(nil)
+
+// withFakePool points the backend at an in-memory pool for the duration of
+// a test.
+func withFakePool(t *testing.T) *fakePool {
+	t.Helper()
+	f := newFakePool()
+	prevCfg := currentConfig()
+	prevDial := dialClient
+	Configure(Config{URL: "https://fake", SRUUID: "sr-fake", MgmtNetworkUUID: "net-mgmt"})
+	dialClient = func(context.Context, Config) (Client, error) { return f, nil }
+	t.Cleanup(func() { Configure(prevCfg); dialClient = prevDial })
+	return f
+}
+
+func validSpec() machine.Spec {
+	return machine.Spec{
+		ID:        "test",
+		VCPU:      2,
+		MemoryMiB: 512,
+		Boot:      machine.DirectKernel{Vmlinux: "/nonexistent/vmlinux", Cmdline: "root=/dev/xvdb"},
+		RootFS:    machine.RawDisk{Path: "/nonexistent/root.ext4"},
+	}
+}
+
+func TestRegistered(t *testing.T) {
+	if _, err := machine.Get(Name); err != nil {
+		t.Fatalf("backend not registered: %v", err)
+	}
+}
+
+// The Spec fields Xen cannot express must be refused by New, before any
+// side effects — not silently ignored at boot.
+func TestNewRejectsUnsupportedSpec(t *testing.T) {
+	withFakePool(t)
+	b, err := machine.Get(Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := map[string]func(*machine.Spec){
+		"shares":    func(s *machine.Spec) { s.Shares = []machine.Share{{Tag: "repo", HostPath: "/tmp"}} },
+		"vsock":     func(s *machine.Spec) { s.VSockCID = 3 },
+		"usermode":  func(s *machine.Spec) { s.Net = []machine.Net{machine.UserMode{}} },
+		"tap":       func(s *machine.Spec) { s.Net = []machine.Net{machine.TAP{Device: "tap0"}} },
+		"balloon":   func(s *machine.Spec) { s.MemoryMaxMiB = 4096 },
+		"nestedoff": func(s *machine.Spec) { s.NestedVirt = true },
+	}
+
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			spec := validSpec()
+			mutate(&spec)
+			if _, err := b.New(context.Background(), spec, t.TempDir()); !errors.Is(err, machine.ErrUnsupportedSpec) {
+				t.Fatalf("want ErrUnsupportedSpec, got %v", err)
+			}
+		})
+	}
+}
+
+func TestNewRequiresConfigure(t *testing.T) {
+	prev := currentConfig()
+	Configure(Config{})
+	t.Cleanup(func() { Configure(prev) })
+
+	b, _ := machine.Get(Name)
+	if _, err := b.New(context.Background(), validSpec(), t.TempDir()); err == nil {
+		t.Fatal("want error when unconfigured")
+	}
+}
+
+// VSock must fail with the sentinel the machine package documents, so
+// callers can feature-detect rather than string-match.
+func TestVSockUnsupported(t *testing.T) {
+	withFakePool(t)
+	b, _ := machine.Get(Name)
+	m, err := b.New(context.Background(), validSpec(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.VSock(context.Background(), 1024); !errors.Is(err, machine.ErrVSockUnsupported) {
+		t.Fatalf("want ErrVSockUnsupported, got %v", err)
+	}
+}
+
+func TestOptionalInterfaces(t *testing.T) {
+	withFakePool(t)
+	b, _ := machine.Get(Name)
+	m, err := b.New(context.Background(), validSpec(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.(machine.Pauseable); !ok {
+		t.Error("want Pauseable")
+	}
+	if _, ok := m.(machine.Suspendable); !ok {
+		t.Error("want Suspendable")
+	}
+	if _, ok := m.(machine.Snapshottable); !ok {
+		t.Error("want Snapshottable")
+	}
+	if _, ok := m.(ControlDialer); !ok {
+		t.Error("want ControlDialer")
+	}
+	if b.Capabilities().VSock {
+		t.Error("Caps.VSock must be false on Xen")
+	}
+	if !b.Capabilities().Snapshot {
+		t.Error("Caps.Snapshot must be true")
+	}
+}
+
+// Suspend writes a pointer file rather than a memory image, since XAPI
+// keeps the image in the SR. Round-tripping it is the contract this
+// backend actually has to honour.
+func TestSuspendPointerRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	want := pointer{Kind: "suspend", VM: "vm-1"}
+	if err := writePointer(dir, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readPointer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+// TODO(create): once Create is implemented, assert the call ordering
+// against fakePool.calls — import before clone, clone before VBDAttach,
+// VIFAttach before VMStart — and that Destroy hard-shuts-down first and
+// never destroys the shared golden VDI.
