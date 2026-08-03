@@ -85,6 +85,62 @@ type jsonrpcClient struct {
 
 var _ Client = (*jsonrpcClient)(nil)
 
+// poolEndpoint validates a pool URL and returns the JSON-RPC endpoint to POST
+// to. Split out of newJSONRPCClient so the rules can be tested without
+// dialling anything.
+//
+// Cleartext is refused outright. login sends the password, and every call
+// after it sends the session ref; on http:// both cross the wire in the
+// clear. InsecureTLS skips certificate verification, which is a different and
+// much smaller concession than no TLS at all, and an operator who set it has
+// not agreed to this.
+//
+// Parsing rather than string-matching also means a URL with no scheme fails
+// naming the field, instead of surfacing later out of
+// http.NewRequestWithContext as an error mentioning neither Config nor URL.
+func poolEndpoint(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		// Report the reason without the URL. *url.Error stringifies to
+		// include the raw input, and a URL that fails to parse may still
+		// have carried credentials in it: "https://root:pw@host:notaport"
+		// fails on the port and never reaches the u.User check below. This
+		// is the one path where a password reaches a log while apparently
+		// only reporting a syntax error. Deliberately %v rather than %w, so
+		// no caller can unwrap back to something holding the raw string.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			return "", fmt.Errorf("xapi: Config.URL is not a URL: %v", ue.Err)
+		}
+		return "", errors.New("xapi: Config.URL is not a URL")
+	}
+	if u.Scheme != "https" || u.Host == "" {
+		return "", fmt.Errorf("xapi: Config.URL must be https://host, got %q", raw)
+	}
+
+	// Refuse the parts of a URL a pool endpoint has no use for, rather than
+	// dropping them quietly. Credentials matter most: they belong in
+	// Config.Username and Config.Password, not in a string kept as the
+	// endpoint field and printed by anything that logs it.
+	if u.User != nil {
+		return "", errors.New(
+			"xapi: Config.URL must not carry credentials; use Config.Username and Config.Password")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("xapi: Config.URL must not carry a query or fragment, got %q", raw)
+	}
+
+	// Build from the parsed parts. Appending to the raw string glued the path
+	// onto whatever came last, so "https://pool?x=1" produced
+	// "https://pool?x=1/jsonrpc". The checks above already make that
+	// unreachable; constructing this way keeps it so if they ever loosen.
+	return (&url.URL{
+		Scheme: u.Scheme,
+		Host:   u.Host,
+		Path:   strings.TrimSuffix(u.Path, "/") + "/jsonrpc",
+	}).String(), nil
+}
+
 // newJSONRPCClient dials the pool and logs in. It returns the concrete type
 // so that tests can reach the few pool queries that deliberately are not on
 // the Client interface.
@@ -96,25 +152,13 @@ func newJSONRPCClient(ctx context.Context, c Config) (*jsonrpcClient, error) {
 		return nil, errors.New("xapi: Config.Username is required")
 	}
 
-	// Refuse a cleartext endpoint. login sends the password, and every call
-	// after it sends the session ref; on http:// both cross the wire in the
-	// clear. InsecureTLS skips certificate verification, which is a
-	// different and much smaller concession than no TLS at all — an
-	// operator who set it has not agreed to this.
-	//
-	// Parsing here also means a URL with no scheme fails naming the field,
-	// rather than surfacing later out of http.NewRequestWithContext as an
-	// error that mentions neither Config nor URL.
-	u, err := url.Parse(c.URL)
+	endpoint, err := poolEndpoint(c.URL)
 	if err != nil {
-		return nil, fmt.Errorf("xapi: Config.URL is not a URL: %w", err)
-	}
-	if u.Scheme != "https" || u.Host == "" {
-		return nil, fmt.Errorf("xapi: Config.URL must be https://host, got %q", c.URL)
+		return nil, err
 	}
 
 	cl := &jsonrpcClient{
-		endpoint: strings.TrimSuffix(c.URL, "/") + "/jsonrpc",
+		endpoint: endpoint,
 		username: c.Username,
 		password: c.Password,
 		http: &http.Client{
@@ -134,6 +178,23 @@ func newJSONRPCClient(ctx context.Context, c Config) (*jsonrpcClient, error) {
 			// No client-level Timeout on purpose: each call carries its own
 			// context, and a fixed deadline here would eventually truncate
 			// the long-running VDI import this transport still has to grow.
+
+			// The scheme check above only constrains the URL the operator
+			// configured. Without this, a front-end that redirected https to
+			// http would undo it mid-session: 307 and 308 preserve the method
+			// and the body, so the login credentials really would be re-sent
+			// in the clear. Supplying CheckRedirect replaces Go's default, so
+			// the hop limit has to be restated here.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if req.URL.Scheme != "https" {
+					return fmt.Errorf("xapi: refusing redirect to non-https %s://%s",
+						req.URL.Scheme, req.URL.Host)
+				}
+				if len(via) >= 10 {
+					return errors.New("xapi: too many redirects")
+				}
+				return nil
+			},
 		},
 	}
 

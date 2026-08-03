@@ -477,3 +477,75 @@ func TestJSONRPCRejectsCleartextAndSchemelessURLs(t *testing.T) {
 		})
 	}
 }
+
+// A URL carrying credentials, a query or a fragment is refused rather than
+// quietly stripped. Userinfo is the one that matters: it would otherwise end
+// up in the endpoint field and in anything that logs it.
+func TestJSONRPCRejectsUnusableURLParts(t *testing.T) {
+	cases := []struct {
+		name    string
+		url     string
+		wantErr string
+	}{
+		{"userinfo", "https://root:hunter2@pool.lab.example", "must not carry credentials"},
+		// url.Parse fails on an invalid port, so this never reaches the
+		// u.User check. The wrapped *url.Error carries the raw string, which
+		// is how a password reaches a log through the one path that looks
+		// like it is only reporting a syntax error.
+		{"userinfo with unparseable URL", "https://root:hunter2@pool.lab.example:notaport", "Config.URL"},
+		{"query", "https://pool.lab.example?x=1", "query or fragment"},
+		{"fragment", "https://pool.lab.example#frag", "query or fragment"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := newJSONRPCClient(context.Background(), Config{
+				URL: tc.url, Username: "root", Password: "hunter2",
+				InsecureTLS: true,
+			})
+			require.ErrorContains(t, err, tc.wantErr)
+			require.NotContains(t, err.Error(), "hunter2",
+				"the error must not echo a password back into the log")
+		})
+	}
+}
+
+// The endpoint is built from the parsed URL, so a base path survives and a
+// trailing slash does not double up.
+func TestJSONRPCEndpointConstruction(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://pool.lab.example", "https://pool.lab.example/jsonrpc"},
+		{"https://pool.lab.example/", "https://pool.lab.example/jsonrpc"},
+		{"https://pool.lab.example:8443", "https://pool.lab.example:8443/jsonrpc"},
+		{"https://pool.lab.example/xapi", "https://pool.lab.example/xapi/jsonrpc"},
+		{"https://pool.lab.example/xapi/", "https://pool.lab.example/xapi/jsonrpc"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got, err := poolEndpoint(tc.in)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// The scheme check constrains the configured URL. A redirect off https would
+// undo it mid-session, and 307 preserves the method and body, so the login
+// credentials would be re-sent in the clear.
+func TestJSONRPCRefusesRedirectOffHTTPS(t *testing.T) {
+	cleartext := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the client followed a redirect to http and re-sent the request")
+		http.Error(w, "should not be reached", http.StatusOK)
+	}))
+	t.Cleanup(cleartext.Close)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, cleartext.URL+"/jsonrpc", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(srv.Close)
+
+	_, err := newJSONRPCClient(context.Background(), Config{
+		URL: srv.URL, Username: "root", Password: "hunter2", InsecureTLS: true,
+	})
+	require.ErrorContains(t, err, "refusing redirect to non-https")
+	require.NotContains(t, err.Error(), "hunter2")
+}
