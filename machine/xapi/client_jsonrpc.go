@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -93,6 +94,23 @@ func newJSONRPCClient(ctx context.Context, c Config) (*jsonrpcClient, error) {
 	}
 	if c.Username == "" {
 		return nil, errors.New("xapi: Config.Username is required")
+	}
+
+	// Refuse a cleartext endpoint. login sends the password, and every call
+	// after it sends the session ref; on http:// both cross the wire in the
+	// clear. InsecureTLS skips certificate verification, which is a
+	// different and much smaller concession than no TLS at all — an
+	// operator who set it has not agreed to this.
+	//
+	// Parsing here also means a URL with no scheme fails naming the field,
+	// rather than surfacing later out of http.NewRequestWithContext as an
+	// error that mentions neither Config nor URL.
+	u, err := url.Parse(c.URL)
+	if err != nil {
+		return nil, fmt.Errorf("xapi: Config.URL is not a URL: %w", err)
+	}
+	if u.Scheme != "https" || u.Host == "" {
+		return nil, fmt.Errorf("xapi: Config.URL must be https://host, got %q", c.URL)
 	}
 
 	cl := &jsonrpcClient{

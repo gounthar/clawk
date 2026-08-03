@@ -10,8 +10,11 @@ package xapi
 // Optional:
 //
 //	TEST_XAPI_USER=root      # defaults to root
-//	TEST_XAPI_INSECURE=0     # verify the pool's certificate (default: skip,
-//	                         # because a stock XCP-ng cert is self-signed)
+//	TEST_XAPI_INSECURE=false # verify the pool's certificate. Any boolean Go
+//	                         # accepts works (0/1, false/true, f/t). Default
+//	                         # is to skip, because a stock XCP-ng cert is
+//	                         # self-signed; an unparseable value is an error
+//	                         # rather than a silent default.
 //
 // This reads; it creates nothing and destroys nothing, so it is safe to
 // point at a pool that has real VMs on it. The VM named by TEST_XAPI_VM is
@@ -22,6 +25,7 @@ package xapi
 import (
 	"context"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -38,11 +42,26 @@ func poolConfigFromEnv(t *testing.T) Config {
 	if user == "" {
 		user = "root"
 	}
+
+	// Default to skipping verification, because a stock XCP-ng certificate
+	// is self-signed. Parse rather than compare against "0": this is the one
+	// knob that decides whether the pool's certificate is checked, and a
+	// string compare silently gives TEST_XAPI_INSECURE=false the opposite of
+	// what it says. An unparseable value fails the test rather than picking
+	// a default, since guessing here guesses about TLS.
+	insecure := true
+	if v := os.Getenv("TEST_XAPI_INSECURE"); v != "" {
+		b, err := strconv.ParseBool(v)
+		require.NoError(t, err,
+			"TEST_XAPI_INSECURE must be a boolean (1/0, true/false, t/f)")
+		insecure = b
+	}
+
 	return Config{
 		URL:         url,
 		Username:    user,
 		Password:    os.Getenv("TEST_XAPI_PASSWORD"),
-		InsecureTLS: os.Getenv("TEST_XAPI_INSECURE") != "0",
+		InsecureTLS: insecure,
 	}
 }
 

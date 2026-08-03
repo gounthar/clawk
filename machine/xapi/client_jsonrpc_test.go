@@ -41,10 +41,13 @@ type fakeRPC struct {
 	handle func(method string, params []any) (any, *rpcError)
 }
 
+// The fake serves TLS because the transport refuses a cleartext pool URL.
+// Its certificate is self-signed, so dialFake opts into InsecureTLS — the
+// same shape as a stock XCP-ng install, which is the case that matters.
 func newFakeRPC(t *testing.T, handle func(string, []any) (any, *rpcError)) *fakeRPC {
 	t.Helper()
 	f := &fakeRPC{t: t, handle: handle}
-	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
+	f.srv = httptest.NewTLSServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
 	return f
 }
@@ -108,9 +111,10 @@ func loginOnly(method string, params []any) (any, *rpcError) {
 func dialFake(t *testing.T, f *fakeRPC) *jsonrpcClient {
 	t.Helper()
 	cl, err := newJSONRPCClient(context.Background(), Config{
-		URL:      f.srv.URL,
-		Username: "root",
-		Password: "hunter2",
+		URL:         f.srv.URL,
+		Username:    "root",
+		Password:    "hunter2",
+		InsecureTLS: true,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cl.Close() })
@@ -142,7 +146,7 @@ func TestJSONRPCLoginFailureIsSurfaced(t *testing.T) {
 	})
 
 	_, err := newJSONRPCClient(context.Background(), Config{
-		URL: f.srv.URL, Username: "root", Password: "wrong",
+		URL: f.srv.URL, Username: "root", Password: "wrong", InsecureTLS: true,
 	})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "SESSION_AUTHENTICATION_FAILED")
@@ -247,13 +251,13 @@ func TestJSONRPCVMByNameLabel(t *testing.T) {
 }
 
 func TestJSONRPCHTTPErrorIsSurfaced(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "<html>gateway timeout</html>", http.StatusBadGateway)
 	}))
 	t.Cleanup(srv.Close)
 
 	_, err := newJSONRPCClient(context.Background(), Config{
-		URL: srv.URL, Username: "root",
+		URL: srv.URL, Username: "root", InsecureTLS: true,
 	})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "502")
@@ -447,4 +451,29 @@ func TestJSONRPCRequiresURLAndUser(t *testing.T) {
 
 	_, err = newJSONRPCClient(context.Background(), Config{URL: "https://pool"})
 	require.ErrorContains(t, err, "Config.Username is required")
+}
+
+// A cleartext pool URL would put the password on the wire at login and the
+// session ref on every call after it, so it is refused rather than dialled.
+// InsecureTLS must not be read as consent to that: it waives certificate
+// verification, not encryption.
+func TestJSONRPCRejectsCleartextAndSchemelessURLs(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"cleartext", "http://pool.lab.example"},
+		{"no scheme", "pool.lab.example"},
+		{"scheme only", "https://"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := newJSONRPCClient(context.Background(), Config{
+				URL: tc.url, Username: "root", Password: "hunter2",
+				InsecureTLS: true,
+			})
+			require.ErrorContains(t, err, "must be https://host",
+				"the error must name the field an operator has to change")
+		})
+	}
 }
