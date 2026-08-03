@@ -23,6 +23,11 @@ debug-logs/
 .claude/settings.local.json
 .claude/skills/
 
+# Session working state. Records lab host addresses, SR uuids and who owns
+# which VM — none of which belongs in a public repo.
+CONTEXT.md
+.env
+
 # Working notes: implementation plans, scratch write-ups. Kept out of the
 # repo because they age into fiction the moment the code lands — the design
 # rationale that matters belongs in the code and in docs/.

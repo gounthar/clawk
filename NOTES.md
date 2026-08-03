@@ -31,6 +31,41 @@ round trip, name-label lookup, and the power-state enum in both `Running` and `H
 
 The boot VDI builder is still the piece with the least prior art. It deserves its own file.
 
+### Review round on PR #1
+
+Six defects were found and fixed, none of which the fake-pool tests could have caught,
+because each lived on a path no test drove:
+
+- `Destroy` marked the machine destroyed and *then* returned an error, so a second
+  `Destroy` returned nil having torn nothing down and `State` reported `StateDestroyed`
+  for a live VM. Teardown is now its own method, giving `Destroy` a real success path.
+- Nothing called `Client.Close`, so every `Machine` held a pool session. XAPI caps
+  concurrent sessions per pool, making that a shared resource consumed rather than a
+  local leak. Logout is on the success path only — a failed `Destroy` is worth retrying,
+  and closing first would hand the retry a dead session.
+- `Create` wrote `v.ref` under the mutex while five other methods read it without one,
+  and those five skipped the lifecycle checks. A `liveRef` helper now does both jobs and
+  every ref-touching call goes through it.
+- In the smoke tool, the password flag defaulted to `$XAPI_PASSWORD`, and
+  `flag.PrintDefaults` prints any non-zero default — so `-h` leaked it. Separately
+  `log.Fatalf` reached `os.Exit` and skipped the cleanup defers.
+- The wire tests asserted with `require` on the httptest handler goroutine, where
+  `FailNow` calls `runtime.Goexit` and truncates the response instead of reporting the
+  assertion.
+
+Both lifecycle regressions have tests, and both were confirmed to fail against the
+reintroduced defects before being kept — a regression test never seen to fail is not yet
+a test. Verified under `-race`.
+
+**Still open, tracked as issues:** #3 (`Restore` leaves `v.ref` stale), #4 (`NewClient`
+can return a non-nil `Client` holding a nil pointer), #5 (no recovery from an expired
+session), #6 (non-atomic `writePointer`, explicit TLS `MinVersion`), #7 (no CI runs on
+this fork), #8 (sequencing the upstream questions).
+
+One caveat worth carrying: the session leak is **not** gone. `closeClient` runs on
+`Destroy`'s success path, and `Destroy` is still a stub that always fails, so it never
+runs. The fix is correct for when teardown lands; until then the session leaks.
+
 ## The three decisions this backend is built on
 
 Do not silently reverse these. If a change requires reversing one, say so explicitly.
@@ -106,8 +141,13 @@ Still open. Draft the issue; don't assume the answer.
 ## Build order
 
 1. ~~Bind a transport, get `VMPowerState` returning against a real pool.~~ Done.
-2. `VDIImportRaw` + `VDIClone` — prove an `oci.Build` disk survives the trip. **Next**, and
-   the first step that writes to a pool: use a scratch SR.
+2. `VDIImportRaw` + `VDIClone` — prove an `oci.Build` disk survives the trip. **Next.**
+   This is the first step that writes to a pool, so it needs an empty, uncontended,
+   file-based SR (`ext`/NFS/XOSTOR — `VDI.clone` full-copies on LVM) and explicit
+   authorisation to write to whatever host provides it. Do not point it at a pool
+   holding anything anyone cares about. Which host to use, and who else is using it,
+   is recorded in the untracked `CONTEXT.md` — deliberately not here, since this file
+   is public.
 3. Boot VDI builder, then `Create`/`Start` until the console log shows a kernel.
 4. Guest addressing and `Control` — the go/no-go moment.
 5. Only then look at `internal/sandbox.Provider` (5 methods, plus optional
