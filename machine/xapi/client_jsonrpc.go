@@ -31,6 +31,10 @@ import (
 // errNotImplemented marks a Client method this transport has not grown yet.
 var errNotImplemented = errors.New("xapi: not implemented in the JSON-RPC transport yet")
 
+// errNoSession is returned by any call made on a client that has been
+// closed, or whose login never succeeded.
+var errNoSession = errors.New("xapi: no session (client closed, or login failed)")
+
 const (
 	// apiVersion and originator are the third and fourth arguments to
 	// session.login_with_password. The originator shows up in the pool's
@@ -46,14 +50,36 @@ const (
 )
 
 // jsonrpcClient is a Client backed by XAPI's JSON-RPC endpoint. One instance
-// owns one session; Close logs it out.
+// owns one session at a time; Close logs it out.
+//
+// The session is not permanent. XAPI expires it, and a Machine is expected
+// to outlive the operations performed on it — a sandbox can sit idle well
+// past the pool's timeout — so sessionCall re-logs-in once on
+// SESSION_INVALID and retries. That is why the credentials are held for the
+// client's lifetime rather than being discarded after the first login.
 type jsonrpcClient struct {
 	endpoint string
 	http     *http.Client
 	nextID   atomic.Uint64
 
+	// Credentials for re-login. Config already holds these for the life of
+	// the process (Configure is process-global), so keeping them here
+	// widens no exposure that did not already exist.
+	username string
+	password string
+
+	// loginMu serialises re-login so that a fleet of concurrent calls
+	// meeting the same expired session produces one login, not one per
+	// caller. It is never held across a non-login RPC.
+	loginMu sync.Mutex
+
 	mu      sync.Mutex
 	session string
+	// gen increments on every successful login. A caller that saw
+	// SESSION_INVALID passes the generation it used; if gen has already
+	// moved, someone else re-logged-in and there is nothing to do.
+	gen    uint64
+	closed bool
 }
 
 var _ Client = (*jsonrpcClient)(nil)
@@ -71,12 +97,19 @@ func newJSONRPCClient(ctx context.Context, c Config) (*jsonrpcClient, error) {
 
 	cl := &jsonrpcClient{
 		endpoint: strings.TrimSuffix(c.URL, "/") + "/jsonrpc",
+		username: c.Username,
+		password: c.Password,
 		http: &http.Client{
 			Transport: &http.Transport{
 				DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: 60 * time.Second,
 				TLSClientConfig: &tls.Config{
+					// Go's default floor is already 1.2, so this changes
+					// nothing today. It is here as documentation, and so a
+					// future shift in that default cannot quietly lower the
+					// floor under the session token this connection carries.
+					MinVersion:         tls.VersionTLS12,
 					InsecureSkipVerify: c.InsecureTLS, //nolint:gosec // opt-in; see Config.InsecureTLS
 				},
 			},
@@ -86,7 +119,7 @@ func newJSONRPCClient(ctx context.Context, c Config) (*jsonrpcClient, error) {
 		},
 	}
 
-	if err := cl.login(ctx, c.Username, c.Password); err != nil {
+	if err := cl.login(ctx); err != nil {
 		cl.http.CloseIdleConnections()
 		return nil, err
 	}
@@ -179,14 +212,65 @@ func (c *jsonrpcClient) call(ctx context.Context, method string, out any, params
 
 // sessionCall issues an RPC with the session ref as the leading argument,
 // which is every XAPI method except the session.login family.
+//
+// On SESSION_INVALID it logs in again and retries the call once. Exactly
+// once: a second failure is returned, so a pool that rejects every login
+// produces an error rather than a loop.
 func (c *jsonrpcClient) sessionCall(ctx context.Context, method string, out any, params ...any) error {
-	c.mu.Lock()
-	s := c.session
-	c.mu.Unlock()
+	s, gen := c.currentSession()
 	if s == "" {
-		return errors.New("xapi: no session (client closed, or login failed)")
+		return errNoSession
+	}
+
+	err := c.call(ctx, method, out, append([]any{s}, params...)...)
+	if !isSessionInvalid(err) {
+		return err
+	}
+
+	if relErr := c.relogin(ctx, gen); relErr != nil {
+		// Report both: the expired session explains why a re-login was
+		// attempted, and the re-login failure explains why it did not help.
+		return fmt.Errorf("%w (re-login failed: %v)", err, relErr)
+	}
+	s, _ = c.currentSession()
+	if s == "" {
+		return errNoSession
 	}
 	return c.call(ctx, method, out, append([]any{s}, params...)...)
+}
+
+// currentSession returns the session ref and the generation it belongs to.
+// An empty ref means the client is closed or was never logged in.
+func (c *jsonrpcClient) currentSession() (string, uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.session, c.gen
+}
+
+// isSessionInvalid reports whether err is XAPI's SESSION_INVALID, the
+// failure every call returns once the pool has expired the session ref.
+func isSessionInvalid(err error) bool {
+	var re *rpcError
+	return errors.As(err, &re) && re.Message == "SESSION_INVALID"
+}
+
+// relogin replaces an expired session. gen is the generation the caller was
+// using: if it no longer matches, another goroutine has already logged in
+// and this call has nothing to do.
+func (c *jsonrpcClient) relogin(ctx context.Context, gen uint64) error {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+
+	c.mu.Lock()
+	current, closed := c.gen, c.closed
+	c.mu.Unlock()
+	if closed {
+		return errNoSession
+	}
+	if current != gen {
+		return nil // someone else got there first
+	}
+	return c.login(ctx)
 }
 
 func snippet(b []byte) string {
@@ -200,38 +284,58 @@ func snippet(b []byte) string {
 
 // --- session -------------------------------------------------------------
 
-func (c *jsonrpcClient) login(ctx context.Context, user, password string) error {
+// login obtains a session ref and installs it, bumping the generation so
+// that callers holding the previous one know it has been replaced. Callers
+// other than newJSONRPCClient must hold loginMu.
+func (c *jsonrpcClient) login(ctx context.Context) error {
 	var ref string
 	if err := c.call(ctx, "session.login_with_password", &ref,
-		user, password, apiVersion, originator); err != nil {
+		c.username, c.password, apiVersion, originator); err != nil {
 		return err
 	}
 	if ref == "" {
 		return errors.New("xapi: login returned an empty session ref")
 	}
+
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		// Close ran while this login was in flight. Installing the ref now
+		// would resurrect a closed client and leak the session on the pool,
+		// so end it instead.
+		_ = c.logout(ref)
+		return errNoSession
+	}
 	c.session = ref
+	c.gen++
 	c.mu.Unlock()
 	return nil
 }
 
-// Close logs the session out. It is safe to call more than once.
+// Close logs the session out. It is safe to call more than once, and a
+// closed client stays closed: a re-login racing with it will not revive it.
 func (c *jsonrpcClient) Close() error {
 	c.mu.Lock()
 	s := c.session
 	c.session = ""
+	c.closed = true
 	c.mu.Unlock()
 	if s == "" {
 		return nil
 	}
 	defer c.http.CloseIdleConnections()
+	return c.logout(s)
+}
 
-	// Logout gets its own short deadline: Close is often called from a
-	// defer whose context is already cancelled, and leaking the session on
-	// the pool until it expires is worse than a brief wait here.
+// logout ends one session ref.
+//
+// It carries its own short deadline rather than taking a context: Close is
+// often called from a defer whose context is already cancelled, and leaking
+// the session on the pool until it expires is worse than a brief wait here.
+func (c *jsonrpcClient) logout(ref string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return c.call(ctx, "session.logout", nil, s)
+	return c.call(ctx, "session.logout", nil, ref)
 }
 
 // --- implemented calls ----------------------------------------------------

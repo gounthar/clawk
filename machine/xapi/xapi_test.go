@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"testing"
 
 	"github.com/clawkwork/clawk/machine"
@@ -279,6 +280,39 @@ func TestSuspendPointerRoundTrip(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+// writePointer replaces the file atomically, so a second Suspend overwrites
+// a first cleanly and leaves no temp file behind for readPointer to trip on.
+func TestWritePointerReplacesAtomically(t *testing.T) {
+	dir := t.TempDir()
+	if err := writePointer(dir, pointer{Kind: "suspend", VM: "vm-1"}); err != nil {
+		t.Fatal(err)
+	}
+	want := pointer{Kind: "checkpoint", VM: "vm-1", Snapshot: "snap-1"}
+	if err := writePointer(dir, want); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := readPointer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 1 || ents[0].Name() != pointerName {
+		var names []string
+		for _, e := range ents {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("want only %s in the directory, got %v", pointerName, names)
 	}
 }
 

@@ -108,7 +108,16 @@ type VMConfig struct {
 // The Client interface exists so this stays reversible: an XO transport can
 // land later as a second implementation, judged on its own merits.
 func NewClient(ctx context.Context, c Config) (Client, error) {
-	return newJSONRPCClient(ctx, c)
+	// Assign to the concrete type and return an explicit nil on failure.
+	// Returning newJSONRPCClient's pair directly would convert a nil
+	// *jsonrpcClient into a non-nil Client interface holding it, so a
+	// caller's `if cl != nil` would be true for a client that does not
+	// exist.
+	cl, err := newJSONRPCClient(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	return cl, nil
 }
 
 // pointer is the small file this backend writes into the snapshot
@@ -122,7 +131,17 @@ type pointer struct {
 
 const pointerName = "xapi-snapshot.json"
 
-func writePointer(dir string, p pointer) error {
+// writePointer writes the pointer atomically: to a temp file in the same
+// directory, then a rename over the target. A plain write that is cut short
+// by a crash or a full disk leaves a truncated file, and readPointer then
+// fails on a snapshot XAPI took successfully — the pool state is intact but
+// the only handle to it is gone.
+//
+// Done by hand rather than with github.com/google/renameio/v2, which the
+// root module already uses: machine/ is a separate module and this is the
+// one place that needs it. The same reasoning kept the JSON-RPC transport
+// on net/http.
+func writePointer(dir string, p pointer) (err error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -130,7 +149,38 @@ func writePointer(dir string, p pointer) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, pointerName), b, 0o600)
+
+	f, err := os.CreateTemp(dir, pointerName+".tmp*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(tmp)
+		}
+	}()
+
+	if err = f.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err = f.Write(b); err != nil {
+		return err
+	}
+	// Sync before the rename: without it the rename can land while the
+	// file's contents are still only in the page cache, which is the
+	// truncated-file case this function exists to avoid.
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmp, filepath.Join(dir, pointerName)); err != nil {
+		return err
+	}
+	return nil
 }
 
 func readPointer(dir string) (pointer, error) {

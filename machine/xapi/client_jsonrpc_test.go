@@ -7,6 +7,7 @@ package xapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -295,6 +296,149 @@ func TestJSONRPCUnimplementedMethodsReturnError(t *testing.T) {
 	require.ErrorIs(t, err, errNotImplemented)
 
 	require.Len(t, f.requests(), 1, "unimplemented calls must not reach the pool")
+}
+
+// sessionPool is a fake pool that tracks which session ref is currently
+// valid, so an expiry can be simulated and the re-login counted. Its own mu
+// guards it because handle runs on the httptest handler goroutines.
+type sessionPool struct {
+	mu     sync.Mutex
+	valid  string
+	logins int
+	// rejectAll makes every session ref invalid, including freshly issued
+	// ones — the pool that cannot be recovered from.
+	rejectAll bool
+	// loginErr, once set, fails every login after the first.
+	loginErr bool
+}
+
+func (p *sessionPool) handle(method string, params []any) (any, *rpcError) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	switch method {
+	case "session.login_with_password":
+		if p.loginErr && p.logins > 0 {
+			return nil, &rpcError{Code: 1, Message: "SESSION_AUTHENTICATION_FAILED"}
+		}
+		p.logins++
+		p.valid = fmt.Sprintf("OpaqueRef:session-%d", p.logins)
+		return p.valid, nil
+	case "session.logout":
+		return struct{}{}, nil
+	case "VM.get_power_state":
+		if p.rejectAll || len(params) == 0 || params[0] != p.valid {
+			return nil, &rpcError{Code: 1, Message: "SESSION_INVALID"}
+		}
+		return string(PowerRunning), nil
+	}
+	return nil, nil
+}
+
+// expire invalidates the session the client is holding, the way XAPI does
+// when it times one out.
+func (p *sessionPool) expire() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.valid = ""
+}
+
+func (p *sessionPool) loginCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.logins
+}
+
+// An expired session must not end the client. XAPI times sessions out, and
+// a sandbox can sit idle for longer than the timeout.
+func TestJSONRPCRetriesOnceAfterSessionInvalid(t *testing.T) {
+	p := &sessionPool{}
+	f := newFakeRPC(t, p.handle)
+	cl := dialFake(t, f)
+	require.Equal(t, 1, p.loginCount())
+
+	p.expire()
+
+	state, err := cl.VMPowerState(context.Background(), VMRef("OpaqueRef:vm"))
+	require.NoError(t, err, "an expired session should be replaced, not returned")
+	require.Equal(t, PowerRunning, state)
+	require.Equal(t, 2, p.loginCount(), "exactly one re-login")
+
+	// And the replacement is durable: the next call reuses it.
+	_, err = cl.VMPowerState(context.Background(), VMRef("OpaqueRef:vm"))
+	require.NoError(t, err)
+	require.Equal(t, 2, p.loginCount(), "no login per call")
+}
+
+// The retry is once, not a loop. A pool that rejects every session must
+// produce an error rather than spin.
+func TestJSONRPCSessionRetryDoesNotLoop(t *testing.T) {
+	p := &sessionPool{rejectAll: true}
+	f := newFakeRPC(t, p.handle)
+	cl := dialFake(t, f)
+
+	_, err := cl.VMPowerState(context.Background(), VMRef("OpaqueRef:vm"))
+	require.ErrorContains(t, err, "SESSION_INVALID")
+
+	var calls int
+	for _, m := range f.methods() {
+		if m == "VM.get_power_state" {
+			calls++
+		}
+	}
+	require.Equal(t, 2, calls, "the original call and one retry")
+	require.Equal(t, 2, p.loginCount(), "one re-login attempt")
+}
+
+// When the re-login itself fails, both failures have to reach the operator:
+// the expired session explains the attempt, the login error explains why it
+// did not help.
+func TestJSONRPCReloginFailureReportsBoth(t *testing.T) {
+	p := &sessionPool{loginErr: true}
+	f := newFakeRPC(t, p.handle)
+	cl := dialFake(t, f)
+
+	p.expire()
+
+	_, err := cl.VMPowerState(context.Background(), VMRef("OpaqueRef:vm"))
+	require.ErrorContains(t, err, "SESSION_INVALID")
+	require.ErrorContains(t, err, "SESSION_AUTHENTICATION_FAILED")
+}
+
+// Concurrent callers meeting the same expired session must produce one
+// login between them, not one each.
+func TestJSONRPCConcurrentCallersReloginOnce(t *testing.T) {
+	p := &sessionPool{}
+	f := newFakeRPC(t, p.handle)
+	cl := dialFake(t, f)
+
+	p.expire()
+
+	const callers = 8
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = cl.VMPowerState(context.Background(), VMRef("OpaqueRef:vm"))
+		}()
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		require.NoError(t, err, "caller %d", i)
+	}
+	require.Equal(t, 2, p.loginCount(), "one re-login for all callers, not one each")
+}
+
+// NewClient returns the Client interface. A failed dial must produce a nil
+// interface, not a non-nil one wrapping a nil *jsonrpcClient — testify's
+// Nil would not catch the difference, so compare directly.
+func TestNewClientReturnsNilInterfaceOnFailure(t *testing.T) {
+	cl, err := NewClient(context.Background(), Config{Username: "root"})
+	require.Error(t, err)
+	require.True(t, cl == nil, "a failed NewClient must return a nil Client")
 }
 
 func TestJSONRPCRequiresURLAndUser(t *testing.T) {

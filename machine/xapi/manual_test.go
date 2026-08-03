@@ -15,7 +15,9 @@ package xapi
 //
 // This reads; it creates nothing and destroys nothing, so it is safe to
 // point at a pool that has real VMs on it. The VM named by TEST_XAPI_VM is
-// only ever asked for its power state.
+// only ever asked for its power state. The one thing here that changes any
+// pool state is TestPoolSessionRecovery_Manual ending its own session, which
+// touches no storage and no VM.
 
 import (
 	"context"
@@ -96,6 +98,46 @@ func TestPoolVMPowerState_Manual(t *testing.T) {
 		[]PowerState{PowerHalted, PowerPaused, PowerRunning, PowerSuspended},
 		state, "power state must be one of XAPI's four")
 	t.Logf("VM %q power state: %s", name, state)
+}
+
+// TestPoolSessionRecovery_Manual is the one part of the session-recovery
+// work that a fake pool cannot vouch for.
+//
+// The unit tests assert that sessionCall retries on SESSION_INVALID, but
+// they do so against a fake that returns the error name this package
+// expects — so they prove the retry logic and nothing about whether XAPI
+// actually names it that way over JSON-RPC. If the real name or shape
+// differs, isSessionInvalid never matches, the retry never fires, and every
+// unit test still passes. This is where that shows up.
+//
+// The session is ended behind the client's back, which is the closest thing
+// to an XAPI timeout available on demand. Read-only otherwise: VM.get_all
+// lists refs and touches no storage.
+func TestPoolSessionRecovery_Manual(t *testing.T) {
+	cfg := poolConfigFromEnv(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cl, err := newJSONRPCClient(ctx, cfg)
+	require.NoError(t, err, "login to %s", cfg.URL)
+	defer cl.Close()
+
+	first, gen := cl.currentSession()
+	require.NotEmpty(t, first, "session ref after login")
+	require.NoError(t, cl.logout(first), "end the session from under the client")
+
+	var refs []string
+	err = cl.sessionCall(ctx, "VM.get_all", &refs)
+	require.NoError(t, err,
+		"a call meeting an ended session must recover; a SESSION_INVALID here "+
+			"means the pool names the failure something isSessionInvalid does not match")
+
+	second, gen2 := cl.currentSession()
+	require.NotEqual(t, first, second, "the session ref must have been replaced")
+	require.Equal(t, gen+1, gen2, "exactly one re-login")
+	t.Logf("session %s expired, recovered as %s; VM.get_all returned %d refs",
+		first, second, len(refs))
 }
 
 // TestPoolUnimplemented_Manual checks that the calls this transport has not
