@@ -488,6 +488,11 @@ func TestJSONRPCRejectsUnusableURLParts(t *testing.T) {
 		wantErr string
 	}{
 		{"userinfo", "https://root:hunter2@pool.lab.example", "must not carry credentials"},
+		// url.Parse fails on an invalid port, so this never reaches the
+		// u.User check. The wrapped *url.Error carries the raw string, which
+		// is how a password reaches a log through the one path that looks
+		// like it is only reporting a syntax error.
+		{"userinfo with unparseable URL", "https://root:hunter2@pool.lab.example:notaport", "Config.URL"},
 		{"query", "https://pool.lab.example?x=1", "query or fragment"},
 		{"fragment", "https://pool.lab.example#frag", "query or fragment"},
 	}

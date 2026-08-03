@@ -101,7 +101,18 @@ var _ Client = (*jsonrpcClient)(nil)
 func poolEndpoint(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("xapi: Config.URL is not a URL: %w", err)
+		// Report the reason without the URL. *url.Error stringifies to
+		// include the raw input, and a URL that fails to parse may still
+		// have carried credentials in it: "https://root:pw@host:notaport"
+		// fails on the port and never reaches the u.User check below. This
+		// is the one path where a password reaches a log while apparently
+		// only reporting a syntax error. Deliberately %v rather than %w, so
+		// no caller can unwrap back to something holding the raw string.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			return "", fmt.Errorf("xapi: Config.URL is not a URL: %v", ue.Err)
+		}
+		return "", errors.New("xapi: Config.URL is not a URL")
 	}
 	if u.Scheme != "https" || u.Host == "" {
 		return "", fmt.Errorf("xapi: Config.URL must be https://host, got %q", raw)
