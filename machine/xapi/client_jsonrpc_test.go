@@ -9,19 +9,32 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const testSession = "OpaqueRef:11111111-2222-3333-4444-555555555555"
 
 // fakeRPC is a pool that answers JSON-RPC, recording every request it sees.
+//
+// serve runs on the httptest handler goroutine, not the test's. Two
+// consequences shape this type:
+//
+//   - It asserts with assert, never require. require.FailNow calls
+//     runtime.Goexit, which would unwind the handler goroutine mid-response;
+//     the client then sees a truncated body and reports a decode error
+//     instead of the assertion that explains what actually went wrong.
+//   - Everything the handler touches is guarded by mu, since the test
+//     goroutine reads it concurrently.
 type fakeRPC struct {
-	t    *testing.T
-	srv  *httptest.Server
-	reqs []rpcRequest
+	t   *testing.T
+	srv *httptest.Server
 
+	mu   sync.Mutex
+	reqs []rpcRequest
 	// handle answers a method; returning (nil, nil) falls through to a
 	// generic "no such method" XAPI error.
 	handle func(method string, params []any) (any, *rpcError)
@@ -36,16 +49,24 @@ func newFakeRPC(t *testing.T, handle func(string, []any) (any, *rpcError)) *fake
 }
 
 func (f *fakeRPC) serve(w http.ResponseWriter, r *http.Request) {
-	require.Equal(f.t, "/jsonrpc", r.URL.Path, "transport must POST to /jsonrpc")
-	require.Equal(f.t, http.MethodPost, r.Method)
-	require.Equal(f.t, "application/json", r.Header.Get("Content-Type"))
+	assert.Equal(f.t, "/jsonrpc", r.URL.Path, "transport must POST to /jsonrpc")
+	assert.Equal(f.t, http.MethodPost, r.Method)
+	assert.Equal(f.t, "application/json", r.Header.Get("Content-Type"))
 
 	var req rpcRequest
-	require.NoError(f.t, json.NewDecoder(r.Body).Decode(&req))
-	require.Equal(f.t, "2.0", req.JSONRPC)
-	f.reqs = append(f.reqs, req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		assert.NoError(f.t, err, "decode request")
+		http.Error(w, "bad request body", http.StatusBadRequest)
+		return
+	}
+	assert.Equal(f.t, "2.0", req.JSONRPC)
 
-	result, rerr := f.handle(req.Method, req.Params)
+	f.mu.Lock()
+	f.reqs = append(f.reqs, req)
+	handle := f.handle
+	f.mu.Unlock()
+
+	result, rerr := handle(req.Method, req.Params)
 	if rerr == nil && result == nil {
 		rerr = &rpcError{Code: 1, Message: "MESSAGE_METHOD_UNKNOWN"}
 	}
@@ -57,12 +78,19 @@ func (f *fakeRPC) serve(w http.ResponseWriter, r *http.Request) {
 		resp["result"] = result
 	}
 	w.Header().Set("Content-Type", "application/json")
-	require.NoError(f.t, json.NewEncoder(w).Encode(resp))
+	assert.NoError(f.t, json.NewEncoder(w).Encode(resp))
+}
+
+// requests returns a copy of what the handler has recorded so far.
+func (f *fakeRPC) requests() []rpcRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]rpcRequest(nil), f.reqs...)
 }
 
 func (f *fakeRPC) methods() []string {
 	var m []string
-	for _, r := range f.reqs {
+	for _, r := range f.requests() {
 		m = append(m, r.Method)
 	}
 	return m
@@ -95,7 +123,7 @@ func TestJSONRPCLoginSendsExpectedParams(t *testing.T) {
 	require.Equal(t, []string{"session.login_with_password"}, f.methods())
 	require.Equal(t,
 		[]any{"root", "hunter2", apiVersion, originator},
-		f.reqs[0].Params,
+		f.requests()[0].Params,
 		"login takes user, password, api version, originator")
 
 	cl.mu.Lock()
@@ -137,7 +165,8 @@ func TestJSONRPCCallsCarrySessionRef(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, PowerRunning, state)
 
-	last := f.reqs[len(f.reqs)-1]
+	reqs := f.requests()
+	last := reqs[len(reqs)-1]
 	require.Equal(t, "VM.get_power_state", last.Method)
 	require.Equal(t, []any{testSession, "OpaqueRef:vm"}, last.Params,
 		"session ref leads every non-login call")
@@ -160,38 +189,60 @@ func TestJSONRPCPowerStateRejectsUnknownValue(t *testing.T) {
 }
 
 func TestJSONRPCVMByNameLabel(t *testing.T) {
-	var refs []string
-	f := newFakeRPC(t, func(method string, _ []any) (any, *rpcError) {
-		switch method {
-		case "session.login_with_password":
-			return testSession, nil
-		case "VM.get_by_name_label":
-			return refs, nil
-		}
-		return nil, nil
-	})
-	cl := dialFake(t, f)
-	ctx := context.Background()
+	// Each case builds its own pool so the ref list is fixed before the
+	// server starts. Sharing one fake and reassigning the refs between
+	// subtests would have the test goroutine writing what the handler
+	// goroutine reads.
+	cases := []struct {
+		name    string
+		refs    []string
+		label   string
+		wantRef VMRef
+		wantErr string
+	}{
+		{
+			name:    "one match",
+			refs:    []string{"OpaqueRef:only"},
+			label:   "alpine",
+			wantRef: "OpaqueRef:only",
+		},
+		{
+			name:    "no match",
+			refs:    nil,
+			label:   "ghost",
+			wantErr: `no VM with name-label "ghost"`,
+		},
+		{
+			name:    "ambiguous",
+			refs:    []string{"OpaqueRef:a", "OpaqueRef:b"},
+			label:   "dup",
+			wantErr: "refusing to guess",
+		},
+	}
 
-	t.Run("one match", func(t *testing.T) {
-		refs = []string{"OpaqueRef:only"}
-		ref, err := cl.VMByNameLabel(ctx, "alpine")
-		require.NoError(t, err)
-		require.Equal(t, VMRef("OpaqueRef:only"), ref)
-	})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			refs := tc.refs
+			f := newFakeRPC(t, func(method string, _ []any) (any, *rpcError) {
+				switch method {
+				case "session.login_with_password":
+					return testSession, nil
+				case "VM.get_by_name_label":
+					return refs, nil
+				}
+				return nil, nil
+			})
+			cl := dialFake(t, f)
 
-	t.Run("no match", func(t *testing.T) {
-		refs = nil
-		_, err := cl.VMByNameLabel(ctx, "ghost")
-		require.ErrorContains(t, err, `no VM with name-label "ghost"`)
-	})
-
-	t.Run("ambiguous", func(t *testing.T) {
-		refs = []string{"OpaqueRef:a", "OpaqueRef:b"}
-		_, err := cl.VMByNameLabel(ctx, "dup")
-		require.ErrorContains(t, err, "refusing to guess",
-			"name-labels are not unique in XAPI")
-	})
+			ref, err := cl.VMByNameLabel(context.Background(), tc.label)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantRef, ref)
+		})
+	}
 }
 
 func TestJSONRPCHTTPErrorIsSurfaced(t *testing.T) {
@@ -224,9 +275,9 @@ func TestJSONRPCCloseLogsOutAndIsIdempotent(t *testing.T) {
 	require.NoError(t, cl.Close())
 	require.Contains(t, f.methods(), "session.logout")
 
-	before := len(f.reqs)
+	before := len(f.requests())
 	require.NoError(t, cl.Close(), "second Close is a no-op")
-	require.Len(t, f.reqs, before, "no second logout")
+	require.Len(t, f.requests(), before, "no second logout")
 
 	_, err := cl.VMPowerState(context.Background(), VMRef("OpaqueRef:vm"))
 	require.ErrorContains(t, err, "no session")
@@ -243,7 +294,7 @@ func TestJSONRPCUnimplementedMethodsReturnError(t *testing.T) {
 	_, err = cl.VDIClone(ctx, "vdi")
 	require.ErrorIs(t, err, errNotImplemented)
 
-	require.Len(t, f.reqs, 1, "unimplemented calls must not reach the pool")
+	require.Len(t, f.requests(), 1, "unimplemented calls must not reach the pool")
 }
 
 func TestJSONRPCRequiresURLAndUser(t *testing.T) {

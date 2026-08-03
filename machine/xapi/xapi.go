@@ -231,6 +231,7 @@ type vm struct {
 	ownedNet  string // non-empty if we created the sandbox network
 	created   bool
 	destroyed bool
+	clClosed  bool // pool session logged out; see closeClient
 }
 
 var (
@@ -270,39 +271,96 @@ func (v *vm) Create(ctx context.Context) error {
 	return errors.New("xapi: Create not implemented")
 }
 
+// liveRef returns the VM ref for an operation that needs a machine which has
+// been created and not destroyed.
+//
+// Every call that touches v.ref goes through here. Reading the ref without
+// the mutex is a data race against Create, which writes it under the mutex;
+// and skipping the lifecycle check sends the empty ref to the pool, which
+// answers HANDLE_INVALID instead of the machine package's ErrInvalidState.
+//
+// Callers must not already hold v.mu.
+func (v *vm) liveRef(op string) (VMRef, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.destroyed {
+		return "", fmt.Errorf("%w: %s after Destroy", machine.ErrInvalidState, op)
+	}
+	if !v.created {
+		return "", fmt.Errorf("%w: %s before Create", machine.ErrInvalidState, op)
+	}
+	return v.ref, nil
+}
+
 // Start boots the VM (VM.start). Returns once XAPI reports the guest
 // Running; it does not wait for guest userspace, matching the contract.
 func (v *vm) Start(ctx context.Context) error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if !v.created {
-		return fmt.Errorf("%w: Start before Create", machine.ErrInvalidState)
+	ref, err := v.liveRef("Start")
+	if err != nil {
+		return err
 	}
-	return v.cl.VMStart(ctx, v.ref)
+	return v.cl.VMStart(ctx, ref)
 }
 
 // Stop halts the guest. graceful uses VM.clean_shutdown (ACPI, needs the
 // guest to cooperate); otherwise VM.hard_shutdown.
 func (v *vm) Stop(ctx context.Context, graceful bool) error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return v.cl.VMShutdown(ctx, v.ref, graceful)
+	ref, err := v.liveRef("Stop")
+	if err != nil {
+		return err
+	}
+	return v.cl.VMShutdown(ctx, ref, graceful)
 }
 
 // Destroy hard-shuts-down if needed, then removes the VM, its VBDs, its
 // writable VDIs and any network this machine created. The golden per-image
 // VDI is shared and is never destroyed here.
+// Destroy is the machine's terminal operation, so it is also where the pool
+// session is released. The logout is on the success path only: a Destroy
+// that failed is worth retrying, and closing the client first would hand the
+// retry a dead session, replacing the real error with "no session".
+//
+// Until the teardown below is implemented, Destroy always fails and so never
+// reaches the logout. The session then lives until the pool expires it. That
+// is the honest consequence of an unimplemented Destroy, not a second bug to
+// paper over.
 func (v *vm) Destroy(ctx context.Context) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.destroyed {
 		return nil
 	}
+	if err := v.teardown(ctx); err != nil {
+		// v.destroyed stays false. Marking the machine destroyed while
+		// teardown failed would make the next Destroy return nil having done
+		// nothing, and make State report StateDestroyed for a VM still
+		// running on the pool — exactly the plausible-looking lie the rest of
+		// this file refuses to tell.
+		return err
+	}
+	v.destroyed = true
+	return v.closeClient()
+}
+
+// teardown removes the pool-side resources this machine owns. Split out of
+// Destroy so that Destroy's success path — mark destroyed, log out — is
+// written once and cannot be skipped when this is implemented.
+func (v *vm) teardown(ctx context.Context) error {
 	// TODO: hard_shutdown if running; VM.destroy; VDI.destroy(root);
 	// Network.destroy(ownedNet) if set. Boot VDI is shared: leave it.
 	_ = ctx
-	v.destroyed = true
 	return errors.New("xapi: Destroy not implemented")
+}
+
+// closeClient logs the pool session out. Idempotent, and callers must hold
+// v.mu. XAPI caps concurrent sessions per pool, so a leaked session is a
+// shared resource consumed, not a local one.
+func (v *vm) closeClient() error {
+	if v.clClosed || v.cl == nil {
+		return nil
+	}
+	v.clClosed = true
+	return v.cl.Close()
 }
 
 // State maps XAPI power states onto machine.State.
@@ -343,7 +401,11 @@ func (v *vm) VSock(context.Context, uint32) (net.Conn, error) {
 
 // Control dials the guest agent over the management VIF.
 func (v *vm) Control(ctx context.Context, port uint32) (net.Conn, error) {
-	ip, err := v.cl.VMGuestIP(ctx, v.ref, v.cfg.MgmtNetworkUUID)
+	ref, err := v.liveRef("Control")
+	if err != nil {
+		return nil, err
+	}
+	ip, err := v.cl.VMGuestIP(ctx, ref, v.cfg.MgmtNetworkUUID)
 	if err != nil {
 		return nil, fmt.Errorf("xapi: guest mgmt address: %w", err)
 	}
@@ -353,8 +415,21 @@ func (v *vm) Control(ctx context.Context, port uint32) (net.Conn, error) {
 
 // Pause / Resume: VM.pause and VM.unpause. vCPUs stop, memory stays
 // resident, exactly the Pauseable contract.
-func (v *vm) Pause(ctx context.Context) error  { return v.cl.VMPause(ctx, v.ref) }
-func (v *vm) Resume(ctx context.Context) error { return v.cl.VMUnpause(ctx, v.ref) }
+func (v *vm) Pause(ctx context.Context) error {
+	ref, err := v.liveRef("Pause")
+	if err != nil {
+		return err
+	}
+	return v.cl.VMPause(ctx, ref)
+}
+
+func (v *vm) Resume(ctx context.Context) error {
+	ref, err := v.liveRef("Resume")
+	if err != nil {
+		return err
+	}
+	return v.cl.VMUnpause(ctx, ref)
+}
 
 // Suspend implements machine.Suspendable via VM.suspend, which is a
 // near-exact match for the contract: XAPI writes memory and device state to
@@ -365,20 +440,28 @@ func (v *vm) Resume(ctx context.Context) error { return v.cl.VMUnpause(ctx, v.re
 // the SR, so we write a small pointer file into dir instead and Restore
 // reads it back. Documented divergence, not an accident.
 func (v *vm) Suspend(ctx context.Context, dir string) error {
-	if err := v.cl.VMSuspend(ctx, v.ref); err != nil {
+	ref, err := v.liveRef("Suspend")
+	if err != nil {
 		return err
 	}
-	return writePointer(dir, pointer{Kind: "suspend", VM: string(v.ref)})
+	if err := v.cl.VMSuspend(ctx, ref); err != nil {
+		return err
+	}
+	return writePointer(dir, pointer{Kind: "suspend", VM: string(ref)})
 }
 
 // Snapshot implements machine.Snapshottable via VM.checkpoint (a snapshot
 // with memory), which pauses, saves and resumes.
 func (v *vm) Snapshot(ctx context.Context, dir string) error {
-	snap, err := v.cl.VMCheckpoint(ctx, v.ref, "clawk-"+v.spec.ID)
+	ref, err := v.liveRef("Snapshot")
 	if err != nil {
 		return err
 	}
-	return writePointer(dir, pointer{Kind: "checkpoint", VM: string(v.ref), Snapshot: string(snap)})
+	snap, err := v.cl.VMCheckpoint(ctx, ref, "clawk-"+v.spec.ID)
+	if err != nil {
+		return err
+	}
+	return writePointer(dir, pointer{Kind: "checkpoint", VM: string(ref), Snapshot: string(snap)})
 }
 
 // Restore boots from a directory previously written by Suspend or Snapshot.

@@ -21,6 +21,8 @@ type fakePool struct {
 	// calls records the method sequence, so tests can assert ordering
 	// (e.g. that Destroy hard-shuts-down before VM.destroy).
 	calls []string
+	// closed records that the pool session was logged out.
+	closed bool
 }
 
 func newFakePool() *fakePool {
@@ -144,7 +146,11 @@ func (f *fakePool) VIFAttach(context.Context, VMRef, string, string, string) err
 	return nil
 }
 
-func (f *fakePool) Close() error { return nil }
+func (f *fakePool) Close() error {
+	f.log("Close")
+	f.closed = true
+	return nil
+}
 
 var _ Client = (*fakePool)(nil)
 
@@ -280,3 +286,82 @@ func TestSuspendPointerRoundTrip(t *testing.T) {
 // against fakePool.calls — import before clone, clone before VBDAttach,
 // VIFAttach before VMStart — and that Destroy hard-shuts-down first and
 // never destroys the shared golden VDI.
+
+// --- regressions for the review findings on PR #1 ----------------------
+
+// A Destroy that failed must not mark the machine destroyed. Doing so makes
+// the next Destroy return nil having torn nothing down, and makes State
+// report StateDestroyed for a VM still running on the pool.
+func TestFailedDestroyDoesNotMarkDestroyed(t *testing.T) {
+	f := withFakePool(t)
+	b, err := machine.Get(Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := b.New(context.Background(), validSpec(), t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Destroy is still a stub, so it must fail...
+	if err := m.Destroy(context.Background()); err == nil {
+		t.Fatal("Destroy returned nil; it is unimplemented and must report that")
+	}
+	// ...and failing must not have been recorded as success.
+	if err := m.Destroy(context.Background()); err == nil {
+		t.Fatal("second Destroy returned nil: the first one marked the machine " +
+			"destroyed despite failing")
+	}
+	st, err := m.State(context.Background())
+	if err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	if st == machine.StateDestroyed {
+		t.Fatal("State reports StateDestroyed after a failed Destroy")
+	}
+	if f.closed {
+		t.Fatal("pool session was logged out even though Destroy failed; " +
+			"a retry would find a dead session")
+	}
+}
+
+// Every call that reaches the pool with v.ref must first check that the
+// machine was created and not destroyed. Otherwise the empty ref goes to
+// XAPI, which answers HANDLE_INVALID instead of ErrInvalidState.
+func TestOperationsBeforeCreateAreInvalidState(t *testing.T) {
+	withFakePool(t)
+	b, err := machine.Get(Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := b.New(context.Background(), validSpec(), t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	ops := map[string]func() error{
+		"Start":    func() error { return m.Start(ctx) },
+		"Stop":     func() error { return m.Stop(ctx, false) },
+		"Pause":    func() error { return m.(machine.Pauseable).Pause(ctx) },
+		"Resume":   func() error { return m.(machine.Pauseable).Resume(ctx) },
+		"Suspend":  func() error { return m.(machine.Suspendable).Suspend(ctx, dir) },
+		"Snapshot": func() error { return m.(machine.Snapshottable).Snapshot(ctx, dir) },
+		"Control": func() error {
+			_, err := m.(ControlDialer).Control(ctx, 1024)
+			return err
+		},
+	}
+	for name, op := range ops {
+		t.Run(name, func(t *testing.T) {
+			err := op()
+			if err == nil {
+				t.Fatalf("%s before Create returned nil", name)
+			}
+			if !errors.Is(err, machine.ErrInvalidState) {
+				t.Fatalf("%s before Create: got %v, want ErrInvalidState", name, err)
+			}
+		})
+	}
+}

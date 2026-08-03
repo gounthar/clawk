@@ -21,6 +21,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -41,10 +42,22 @@ const (
 )
 
 func main() {
+	// All the work happens in run so that deferred cleanup — the temp dir and
+	// the machine teardown — actually runs on failure. log.Fatal calls
+	// os.Exit, which skips defers.
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	var (
-		url        = flag.String("url", "", "pool master URL (required)")
-		user       = flag.String("user", "root", "XAPI username")
-		password   = flag.String("password", os.Getenv("XAPI_PASSWORD"), "XAPI password (or $XAPI_PASSWORD)")
+		url  = flag.String("url", "", "pool master URL (required)")
+		user = flag.String("user", "root", "XAPI username")
+		// Left empty on purpose: flag.PrintDefaults prints any default that
+		// is not the zero value, so seeding this from the environment would
+		// put the password in `smoke-xapi -h` output. Filled in after Parse.
+		password   = flag.String("password", "", "XAPI password (prefer $XAPI_PASSWORD)")
 		srUUID     = flag.String("sr", "", "SR uuid for rootfs VDIs (required, prefer a file-based SR)")
 		mgmtNet    = flag.String("mgmt-net", "", "network uuid for the control VIF (required)")
 		sandboxNet = flag.String("sandbox-net", "", "network uuid for the guest VIF; empty creates a private one")
@@ -57,9 +70,17 @@ func main() {
 	)
 	flag.Parse()
 
-	for name, v := range map[string]string{"url": *url, "sr": *srUUID, "mgmt-net": *mgmtNet, "kernel": *kernel} {
-		if v == "" {
-			log.Fatalf("-%s is required", name)
+	if *password == "" {
+		*password = os.Getenv("XAPI_PASSWORD")
+	}
+
+	// A slice, not a map: the required flags are reported in a stable order
+	// rather than whichever one map iteration happens to reach first.
+	for _, req := range []struct{ name, value string }{
+		{"url", *url}, {"sr", *srUUID}, {"mgmt-net", *mgmtNet}, {"kernel", *kernel},
+	} {
+		if req.value == "" {
+			return fmt.Errorf("-%s is required", req.name)
 		}
 	}
 
@@ -68,7 +89,7 @@ func main() {
 
 	work, err := os.MkdirTemp("", "smoke-xapi-")
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer os.RemoveAll(work)
 
@@ -81,7 +102,7 @@ func main() {
 		CacheDir: filepath.Join(work, "oci"),
 	})
 	if err != nil {
-		log.Fatalf("oci build: %v", err)
+		return fmt.Errorf("oci build: %w", err)
 	}
 	log.Printf("rootfs %s (digest %s)", built.DiskPath, built.Digest)
 
@@ -98,7 +119,7 @@ func main() {
 
 	b, err := machine.Get(xapi.Name)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	m, err := b.New(ctx, machine.Spec{
@@ -117,12 +138,12 @@ func main() {
 		Serial: machine.Serial{LogPath: filepath.Join(work, "console.log")},
 	}, filepath.Join(work, "state"))
 	if err != nil {
-		log.Fatalf("new machine: %v", err)
+		return fmt.Errorf("new machine: %w", err)
 	}
 
 	// 3. Create, start, and wait for the guest to be addressable.
 	if err := m.Create(ctx); err != nil {
-		log.Fatalf("create: %v", err)
+		return fmt.Errorf("create: %w", err)
 	}
 	if !*keep {
 		defer func() {
@@ -134,12 +155,12 @@ func main() {
 
 	start := time.Now()
 	if err := m.Start(ctx); err != nil {
-		log.Fatalf("start: %v", err)
+		return fmt.Errorf("start: %w", err)
 	}
 	log.Printf("VM.start returned after %s", time.Since(start).Round(time.Millisecond))
 
 	if err := waitState(ctx, m, machine.StateRunning, 60*time.Second); err != nil {
-		log.Fatalf("waiting for running: %v", err)
+		return fmt.Errorf("waiting for running: %w", err)
 	}
 	log.Printf("running after %s", time.Since(start).Round(time.Millisecond))
 
@@ -147,14 +168,14 @@ func main() {
 	//    other backend would use vsock.
 	dialer, ok := m.(xapi.ControlDialer)
 	if !ok {
-		log.Fatal("backend does not implement ControlDialer")
+		return errors.New("backend does not implement ControlDialer")
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 
 	conn, err := dialer.Control(dialCtx, controlPort)
 	if err != nil {
-		log.Fatalf("control channel: %v (this is the load-bearing failure — "+
+		return fmt.Errorf("control channel: %w (this is the load-bearing failure — "+
 			"if the guest is up and this does not connect, the mgmt VIF or the "+
 			"guest agent is the problem, not the backend)", err)
 	}
@@ -187,6 +208,7 @@ func main() {
 			}
 		}
 	}
+	return nil
 }
 
 func waitState(ctx context.Context, m machine.Machine, want machine.State, timeout time.Duration) error {
