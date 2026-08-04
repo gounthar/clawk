@@ -232,6 +232,11 @@ type vm struct {
 	created   bool
 	destroyed bool
 	clClosed  bool // pool session logged out; see closeClient
+	// restoring marks the window where a Restore has passed its lifecycle
+	// check and released the mutex for the resume, but has not yet committed
+	// ref and created. Destroy and a second Restore both refuse while it is
+	// held. See Restore.
+	restoring bool
 }
 
 var (
@@ -320,23 +325,38 @@ func (v *vm) Stop(ctx context.Context, graceful bool) error {
 // that failed is worth retrying, and closing the client first would hand the
 // retry a dead session, replacing the real error with "no session".
 //
-// Until the teardown below is implemented, Destroy always fails and so never
-// reaches the logout. The session then lives until the pool expires it. That
-// is the honest consequence of an unimplemented Destroy, not a second bug to
-// paper over.
+// A machine that was never created owns nothing on the pool, so there is
+// nothing to tear down and teardown is skipped. Otherwise the empty ref
+// reaches XAPI, which answers HANDLE_INVALID — the caller is told its handle
+// is bad rather than that the machine was never created.
+//
+// Until the teardown below is implemented, Destroy on a machine that *was*
+// created always fails and so never reaches the logout. The session then
+// lives until the pool expires it. That is the honest consequence of an
+// unimplemented Destroy, not a second bug to paper over.
 func (v *vm) Destroy(ctx context.Context) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.destroyed {
 		return nil
 	}
-	if err := v.teardown(ctx); err != nil {
-		// v.destroyed stays false. Marking the machine destroyed while
-		// teardown failed would make the next Destroy return nil having done
-		// nothing, and make State report StateDestroyed for a VM still
-		// running on the pool — exactly the plausible-looking lie the rest of
-		// this file refuses to tell.
-		return err
+	if v.restoring {
+		// A Restore is mid-flight: it has resumed, or is about to, and has
+		// not yet recorded the ref. Tearing down now would mark the machine
+		// destroyed, skip teardown because created is still false, and leave
+		// the resumed VM running on the pool with nothing left addressing
+		// it. Refuse and let the caller retry once Restore has committed.
+		return fmt.Errorf("%w: Destroy during Restore", machine.ErrInvalidState)
+	}
+	if v.created {
+		if err := v.teardown(ctx); err != nil {
+			// v.destroyed stays false. Marking the machine destroyed while
+			// teardown failed would make the next Destroy return nil having
+			// done nothing, and make State report StateDestroyed for a VM
+			// still running on the pool — exactly the plausible-looking lie
+			// the rest of this file refuses to tell.
+			return err
+		}
 	}
 	v.destroyed = true
 	return v.closeClient()
@@ -364,16 +384,24 @@ func (v *vm) closeClient() error {
 }
 
 // State maps XAPI power states onto machine.State.
+//
+// The fields are copied out under the lock and the lock is dropped before
+// the pool call, for the reason liveRef documents: a slow or hung
+// VM.get_power_state must not queue every other operation on this machine
+// behind it. Destroy is the call you reach for when a pool has stopped
+// answering, and it takes the same mutex.
 func (v *vm) State(ctx context.Context) (machine.State, error) {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.destroyed {
+	destroyed, created, ref := v.destroyed, v.created, v.ref
+	v.mu.Unlock()
+
+	if destroyed {
 		return machine.StateDestroyed, nil
 	}
-	if !v.created {
+	if !created {
 		return machine.StateStopped, nil
 	}
-	ps, err := v.cl.VMPowerState(ctx, v.ref)
+	ps, err := v.cl.VMPowerState(ctx, ref)
 	if err != nil {
 		return "", err
 	}
@@ -464,19 +492,79 @@ func (v *vm) Snapshot(ctx context.Context, dir string) error {
 	return writePointer(dir, pointer{Kind: "checkpoint", VM: string(ref), Snapshot: string(snap)})
 }
 
-// Restore boots from a directory previously written by Suspend or Snapshot.
+// Restore boots from a directory previously written by Suspend or Snapshot,
+// and adopts the VM it names: the machine is addressable afterwards, so
+// Start, State, Stop and the rest drive the VM that was actually resumed
+// rather than an empty ref.
+//
+// Adoption is why Restore is only legal on a machine that has neither been
+// created nor destroyed. Repointing a created machine would orphan the VM it
+// already holds — nothing would ever tear that one down — and restoring
+// after Destroy would resurrect a machine the caller has finished with.
+// Create refuses the second of those for the same reason.
+//
+// The rootVDI and bootVDI fields stay empty: the pointer file records the VM
+// ref only, and XAPI can be asked for the VBDs when teardown needs them.
+//
+// The mutex is not held across the resume — that is the defect removed from
+// State — so the check and the commit are two separate critical sections,
+// and the gap between them is reachable. v.restoring reserves the transition
+// across that gap: without it a Destroy landing in the middle saw created
+// still false, skipped teardown, marked the machine destroyed and logged out,
+// and then this function committed ref and created on top, leaving a resumed
+// VM that no later Destroy could reach. Two concurrent Restores could also
+// both pass the check and resume different pointers, the second silently
+// overwriting the first. Found by review on PR #12.
 func (v *vm) Restore(ctx context.Context, dir string) error {
 	p, err := readPointer(dir)
 	if err != nil {
 		return err
 	}
+
+	v.mu.Lock()
+	switch {
+	case v.destroyed:
+		v.mu.Unlock()
+		return fmt.Errorf("%w: Restore after Destroy", machine.ErrInvalidState)
+	case v.created:
+		v.mu.Unlock()
+		return fmt.Errorf("%w: Restore onto a created machine", machine.ErrInvalidState)
+	case v.restoring:
+		v.mu.Unlock()
+		return fmt.Errorf("%w: Restore already in progress", machine.ErrInvalidState)
+	}
+	v.restoring = true
+	v.mu.Unlock()
+
+	// From here every return must clear the reservation, or the machine is
+	// left permanently un-destroyable.
+	release := func(adopt bool) {
+		v.mu.Lock()
+		v.restoring = false
+		if adopt {
+			v.ref, v.created = VMRef(p.VM), true
+		}
+		v.mu.Unlock()
+	}
+
 	switch p.Kind {
 	case "suspend":
-		return v.cl.VMResumeFromSuspend(ctx, VMRef(p.VM))
+		if err := v.cl.VMResumeFromSuspend(ctx, VMRef(p.VM)); err != nil {
+			release(false)
+			return err
+		}
 	case "checkpoint":
 		// TODO: VM.revert to the checkpoint, then VM.resume.
+		release(false)
 		return errors.New("xapi: checkpoint restore not implemented")
 	default:
+		release(false)
 		return fmt.Errorf("xapi: unknown snapshot kind %q", p.Kind)
 	}
+
+	// Adopt only once the pool has actually resumed it. A machine marked
+	// created off the back of a failed resume would answer for a VM that is
+	// not running.
+	release(true)
+	return nil
 }

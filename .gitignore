@@ -28,6 +28,11 @@ debug-logs/
 CONTEXT.md
 .env
 
+# Local assistant instructions. Same reasoning as CONTEXT.md: personal
+# working notes, and untracked files are one `git add -A` away from a public
+# repo.
+CLAUDE.md
+
 # Working notes: implementation plans, scratch write-ups. Kept out of the
 # repo because they age into fiction the moment the code lands — the design
 # rationale that matters belongs in the code and in docs/.
