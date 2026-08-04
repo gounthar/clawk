@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +31,10 @@ type fakePool struct {
 	// call open and watch what the rest of the backend can still do while a
 	// pool call is outstanding.
 	powerHook func()
+	// resumeHook runs at the top of VMResumeFromSuspend, for the same reason:
+	// Restore's window between its lifecycle check and its commit is only
+	// reachable while that call is in flight.
+	resumeHook func()
 }
 
 func newFakePool() *fakePool {
@@ -102,6 +107,9 @@ func (f *fakePool) VMSuspend(_ context.Context, ref VMRef) error {
 }
 
 func (f *fakePool) VMResumeFromSuspend(_ context.Context, ref VMRef) error {
+	if f.resumeHook != nil {
+		f.resumeHook()
+	}
 	f.log("VMResume")
 	f.power[ref] = PowerRunning
 	return nil
@@ -582,4 +590,101 @@ func TestRestoreRefusesNonEmptyLifecycle(t *testing.T) {
 			t.Fatalf("got %v, want ErrInvalidState", err)
 		}
 	})
+}
+
+// Restore checks the lifecycle, drops v.mu for the pool call, then commits.
+// A Destroy landing in that window saw created == false, skipped teardown,
+// marked the machine destroyed and logged the session out — and then Restore
+// committed ref and created on top of it. That leaves a VM resumed on the
+// pool that no later Destroy will ever tear down, while State reports
+// StateDestroyed. Found by review on PR #12.
+//
+// The deadlock-free fix cannot be "hold the lock across the resume": that is
+// the defect #9 removed from State. Restore reserves the transition instead,
+// and Destroy refuses while it is held.
+func TestDestroyDuringRestoreCannotInterleave(t *testing.T) {
+	dir := t.TempDir()
+	if err := writePointer(dir, pointer{Kind: "suspend", VM: "vm-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m, f := newMachine(t)
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+	f.resumeHook = func() {
+		close(entered)
+		<-release
+	}
+
+	restoreDone := make(chan error, 1)
+	go func() { restoreDone <- m.(machine.Snapshottable).Restore(context.Background(), dir) }()
+	<-entered // the resume is in flight; Restore has released v.mu.
+
+	destroyErr := m.Destroy(context.Background())
+	releaseOnce()
+	restoreErr := <-restoreDone
+
+	// Exactly one of the two may win. What must never happen is both
+	// "succeeding" into a machine that is destroyed and created at once.
+	if destroyErr == nil && restoreErr == nil {
+		t.Fatal("Destroy and Restore both reported success: the machine is " +
+			"marked destroyed and created at the same time, and the resumed VM " +
+			"is unreachable for teardown")
+	}
+	if destroyErr != nil && !errors.Is(destroyErr, machine.ErrInvalidState) {
+		t.Fatalf("Destroy during Restore: got %v, want ErrInvalidState", destroyErr)
+	}
+
+	st, err := m.State(context.Background())
+	if err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	if restoreErr == nil && st == machine.StateDestroyed {
+		t.Fatal("Restore succeeded but State reports StateDestroyed")
+	}
+}
+
+// Two concurrent Restores must not both pass the lifecycle check and resume
+// different pointer targets, with the later commit silently overwriting
+// v.ref and orphaning the first VM.
+func TestConcurrentRestoreRejectsTheSecond(t *testing.T) {
+	dirA, dirB := t.TempDir(), t.TempDir()
+	if err := writePointer(dirA, pointer{Kind: "suspend", VM: "vm-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePointer(dirB, pointer{Kind: "suspend", VM: "vm-b"}); err != nil {
+		t.Fatal(err)
+	}
+	m, f := newMachine(t)
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+	// Only the first resume blocks. sync.Once is wrong here: Do makes later
+	// callers wait for the first to return, so the second Restore would block
+	// inside the hook instead of reaching the lifecycle check being tested.
+	var resumes atomic.Int32
+	f.resumeHook = func() {
+		if resumes.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+	}
+
+	first := make(chan error, 1)
+	go func() { first <- m.(machine.Snapshottable).Restore(context.Background(), dirA) }()
+	<-entered
+
+	second := m.(machine.Snapshottable).Restore(context.Background(), dirB)
+	releaseOnce()
+	firstErr := <-first
+
+	if firstErr == nil && second == nil {
+		t.Fatal("both Restores succeeded; the second overwrote v.ref and " +
+			"orphaned the VM the first one resumed")
+	}
+	if second != nil && !errors.Is(second, machine.ErrInvalidState) {
+		t.Fatalf("second Restore: got %v, want ErrInvalidState", second)
+	}
 }
