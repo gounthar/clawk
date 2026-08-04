@@ -508,3 +508,78 @@ func TestDestroyWithoutCreateSkipsTeardown(t *testing.T) {
 		t.Errorf("State = %v after a successful Destroy, want %v", st, machine.StateDestroyed)
 	}
 }
+
+// --- issue #3: Restore must leave the machine addressable --------------
+
+// A machine restored from a pointer file must be usable afterwards. Before
+// the fix, Restore resumed the recorded ref but left v.ref empty, so every
+// later call drove a different VM from the one that was actually resumed.
+func TestRestoreAdoptsThePointerRef(t *testing.T) {
+	// The machine that suspends.
+	m, f := newMachine(t)
+	markCreated(t, m, f, "vm-1")
+	dir := t.TempDir()
+	if err := m.(machine.Suspendable).Suspend(context.Background(), dir); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	// A second machine, standing in for a later process, restores it.
+	b, err := machine.Get(Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, err := b.New(context.Background(), validSpec(), t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := m2.(machine.Snapshottable).Restore(context.Background(), dir); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	st, err := m2.State(context.Background())
+	if err != nil {
+		t.Fatalf("State after Restore: %v", err)
+	}
+	if st != machine.StateRunning {
+		t.Fatalf("State after Restore = %v, want %v: the restored machine is not "+
+			"addressable, so v.ref was left stale", st, machine.StateRunning)
+	}
+	if err := m2.Stop(context.Background(), false); err != nil {
+		t.Fatalf("Stop after Restore: %v", err)
+	}
+	if got := f.power["vm-1"]; got != PowerHalted {
+		t.Fatalf("vm-1 power = %v after Stop, want %v: the restored machine drove "+
+			"a different ref from the one it resumed", got, PowerHalted)
+	}
+}
+
+// Restore repoints the machine at whatever the pointer file names. Doing
+// that to a machine that already has a ref would orphan the VM it held, and
+// doing it after Destroy would resurrect a machine the caller has finished
+// with. Both are refused, the same way Create refuses to run after Destroy.
+func TestRestoreRefusesNonEmptyLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	if err := writePointer(dir, pointer{Kind: "suspend", VM: "vm-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("after Create", func(t *testing.T) {
+		m, f := newMachine(t)
+		markCreated(t, m, f, "vm-2")
+		err := m.(machine.Snapshottable).Restore(context.Background(), dir)
+		if !errors.Is(err, machine.ErrInvalidState) {
+			t.Fatalf("got %v, want ErrInvalidState", err)
+		}
+	})
+
+	t.Run("after Destroy", func(t *testing.T) {
+		m, _ := newMachine(t)
+		if err := m.Destroy(context.Background()); err != nil {
+			t.Fatalf("Destroy: %v", err)
+		}
+		err := m.(machine.Snapshottable).Restore(context.Background(), dir)
+		if !errors.Is(err, machine.ErrInvalidState) {
+			t.Fatalf("got %v, want ErrInvalidState", err)
+		}
+	})
+}

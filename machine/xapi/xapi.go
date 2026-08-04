@@ -479,19 +479,53 @@ func (v *vm) Snapshot(ctx context.Context, dir string) error {
 	return writePointer(dir, pointer{Kind: "checkpoint", VM: string(ref), Snapshot: string(snap)})
 }
 
-// Restore boots from a directory previously written by Suspend or Snapshot.
+// Restore boots from a directory previously written by Suspend or Snapshot,
+// and adopts the VM it names: the machine is addressable afterwards, so
+// Start, State, Stop and the rest drive the VM that was actually resumed
+// rather than an empty ref.
+//
+// Adoption is why Restore is only legal on a machine that has neither been
+// created nor destroyed. Repointing a created machine would orphan the VM it
+// already holds — nothing would ever tear that one down — and restoring
+// after Destroy would resurrect a machine the caller has finished with.
+// Create refuses the second of those for the same reason.
+//
+// The rootVDI and bootVDI fields stay empty: the pointer file records the VM
+// ref only, and XAPI can be asked for the VBDs when teardown needs them.
 func (v *vm) Restore(ctx context.Context, dir string) error {
 	p, err := readPointer(dir)
 	if err != nil {
 		return err
 	}
+
+	v.mu.Lock()
+	switch {
+	case v.destroyed:
+		v.mu.Unlock()
+		return fmt.Errorf("%w: Restore after Destroy", machine.ErrInvalidState)
+	case v.created:
+		v.mu.Unlock()
+		return fmt.Errorf("%w: Restore onto a created machine", machine.ErrInvalidState)
+	}
+	v.mu.Unlock()
+
 	switch p.Kind {
 	case "suspend":
-		return v.cl.VMResumeFromSuspend(ctx, VMRef(p.VM))
+		if err := v.cl.VMResumeFromSuspend(ctx, VMRef(p.VM)); err != nil {
+			return err
+		}
 	case "checkpoint":
 		// TODO: VM.revert to the checkpoint, then VM.resume.
 		return errors.New("xapi: checkpoint restore not implemented")
 	default:
 		return fmt.Errorf("xapi: unknown snapshot kind %q", p.Kind)
 	}
+
+	// Adopt only once the pool has actually resumed it. A machine marked
+	// created off the back of a failed resume would answer for a VM that is
+	// not running.
+	v.mu.Lock()
+	v.ref, v.created = VMRef(p.VM), true
+	v.mu.Unlock()
+	return nil
 }
