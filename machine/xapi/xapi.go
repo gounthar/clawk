@@ -364,16 +364,24 @@ func (v *vm) closeClient() error {
 }
 
 // State maps XAPI power states onto machine.State.
+//
+// The fields are copied out under the lock and the lock is dropped before
+// the pool call, for the reason liveRef documents: a slow or hung
+// VM.get_power_state must not queue every other operation on this machine
+// behind it. Destroy is the call you reach for when a pool has stopped
+// answering, and it takes the same mutex.
 func (v *vm) State(ctx context.Context) (machine.State, error) {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.destroyed {
+	destroyed, created, ref := v.destroyed, v.created, v.ref
+	v.mu.Unlock()
+
+	if destroyed {
 		return machine.StateDestroyed, nil
 	}
-	if !v.created {
+	if !created {
 		return machine.StateStopped, nil
 	}
-	ps, err := v.cl.VMPowerState(ctx, v.ref)
+	ps, err := v.cl.VMPowerState(ctx, ref)
 	if err != nil {
 		return "", err
 	}

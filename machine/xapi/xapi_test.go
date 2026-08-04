@@ -5,7 +5,9 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/clawkwork/clawk/machine"
 )
@@ -24,6 +26,10 @@ type fakePool struct {
 	calls []string
 	// closed records that the pool session was logged out.
 	closed bool
+	// powerHook runs at the top of VMPowerState. Tests use it to hold the
+	// call open and watch what the rest of the backend can still do while a
+	// pool call is outstanding.
+	powerHook func()
 }
 
 func newFakePool() *fakePool {
@@ -67,6 +73,9 @@ func (f *fakePool) VMDestroy(_ context.Context, ref VMRef) error {
 }
 
 func (f *fakePool) VMPowerState(_ context.Context, ref VMRef) (PowerState, error) {
+	if f.powerHook != nil {
+		f.powerHook()
+	}
 	ps, ok := f.power[ref]
 	if !ok {
 		return "", errors.New("fake: no such VM")
@@ -323,6 +332,38 @@ func TestWritePointerReplacesAtomically(t *testing.T) {
 
 // --- regressions for the review findings on PR #1 ----------------------
 
+// markCreated fakes what a successful Create would have recorded. Create is
+// still a stub, and the lifecycle rules below are all about a machine that
+// *was* created, so there is no other way to reach that state yet. Same
+// package, so this is white-box on purpose rather than for convenience.
+func markCreated(t *testing.T, m machine.Machine, f *fakePool, ref VMRef) *vm {
+	t.Helper()
+	v, ok := m.(*vm)
+	if !ok {
+		t.Fatalf("want *vm, got %T", m)
+	}
+	v.mu.Lock()
+	v.ref, v.created = ref, true
+	v.mu.Unlock()
+	f.power[ref] = PowerRunning
+	return v
+}
+
+// newMachine returns a fresh machine on the given fake pool.
+func newMachine(t *testing.T) (machine.Machine, *fakePool) {
+	t.Helper()
+	f := withFakePool(t)
+	b, err := machine.Get(Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := b.New(context.Background(), validSpec(), t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return m, f
+}
+
 // A Destroy that failed must not mark the machine destroyed. Doing so makes
 // the next Destroy return nil having torn nothing down, and makes State
 // report StateDestroyed for a VM still running on the pool.
@@ -398,4 +439,47 @@ func TestOperationsBeforeCreateAreInvalidState(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- issue #9: State must not hold v.mu across the pool call -----------
+
+// A hung VM.get_power_state must not block every other operation on the
+// machine. The call you reach for when the pool has stopped answering is
+// exactly the one that would be queued behind it.
+func TestStateDoesNotHoldLockAcrossPoolCall(t *testing.T) {
+	m, f := newMachine(t)
+	markCreated(t, m, f, "vm-1")
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+	f.powerHook = func() {
+		close(entered)
+		<-release
+	}
+
+	stateDone := make(chan struct{})
+	go func() {
+		defer close(stateDone)
+		_, _ = m.State(context.Background())
+	}()
+	<-entered // VMPowerState is now in flight and will not return yet.
+
+	// Snapshot goes through liveRef, which takes v.mu. It touches nothing
+	// else the State call touches, so if it blocks it blocks on the mutex.
+	snapDone := make(chan error, 1)
+	go func() { snapDone <- m.(machine.Snapshottable).Snapshot(context.Background(), t.TempDir()) }()
+
+	select {
+	case err := <-snapDone:
+		if err != nil {
+			t.Errorf("Snapshot: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("Snapshot blocked while State was waiting on the pool: " +
+			"State holds v.mu across VMPowerState")
+	}
+
+	releaseOnce()
+	<-stateDone
 }
