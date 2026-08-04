@@ -368,17 +368,10 @@ func newMachine(t *testing.T) (machine.Machine, *fakePool) {
 // the next Destroy return nil having torn nothing down, and makes State
 // report StateDestroyed for a VM still running on the pool.
 func TestFailedDestroyDoesNotMarkDestroyed(t *testing.T) {
-	f := withFakePool(t)
-	b, err := machine.Get(Name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	m, err := b.New(context.Background(), validSpec(), t.TempDir())
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	m, f := newMachine(t)
+	markCreated(t, m, f, "vm-1")
 
-	// Destroy is still a stub, so it must fail...
+	// teardown is still a stub, so Destroy on a created machine must fail...
 	if err := m.Destroy(context.Background()); err == nil {
 		t.Fatal("Destroy returned nil; it is unimplemented and must report that")
 	}
@@ -482,4 +475,36 @@ func TestStateDoesNotHoldLockAcrossPoolCall(t *testing.T) {
 
 	releaseOnce()
 	<-stateDone
+}
+
+// --- issue #10: Destroy must not run teardown when Create never ran ----
+
+// New() then Destroy() — an abandoned setup, a failed Create, a test — must
+// not reach teardown with an empty ref. It is also the one route into the
+// session leak that can be closed: with no pool-side resources to remove,
+// Destroy has nothing to fail at and can log out.
+func TestDestroyWithoutCreateSkipsTeardown(t *testing.T) {
+	m, f := newMachine(t)
+
+	if err := m.Destroy(context.Background()); err != nil {
+		t.Fatalf("Destroy on a machine that was never created: %v", err)
+	}
+	for _, c := range f.calls {
+		if c != "Close" {
+			t.Errorf("teardown reached the pool for a machine that was never "+
+				"created: calls=%v", f.calls)
+			break
+		}
+	}
+	if !f.closed {
+		t.Error("pool session was not released; nothing was created, so there " +
+			"is nothing for a retry to come back to")
+	}
+	st, err := m.State(context.Background())
+	if err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	if st != machine.StateDestroyed {
+		t.Errorf("State = %v after a successful Destroy, want %v", st, machine.StateDestroyed)
+	}
 }

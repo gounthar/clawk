@@ -320,23 +320,30 @@ func (v *vm) Stop(ctx context.Context, graceful bool) error {
 // that failed is worth retrying, and closing the client first would hand the
 // retry a dead session, replacing the real error with "no session".
 //
-// Until the teardown below is implemented, Destroy always fails and so never
-// reaches the logout. The session then lives until the pool expires it. That
-// is the honest consequence of an unimplemented Destroy, not a second bug to
-// paper over.
+// A machine that was never created owns nothing on the pool, so there is
+// nothing to tear down and teardown is skipped. Otherwise the empty ref
+// reaches XAPI, which answers HANDLE_INVALID — the caller is told its handle
+// is bad rather than that the machine was never created.
+//
+// Until the teardown below is implemented, Destroy on a machine that *was*
+// created always fails and so never reaches the logout. The session then
+// lives until the pool expires it. That is the honest consequence of an
+// unimplemented Destroy, not a second bug to paper over.
 func (v *vm) Destroy(ctx context.Context) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.destroyed {
 		return nil
 	}
-	if err := v.teardown(ctx); err != nil {
-		// v.destroyed stays false. Marking the machine destroyed while
-		// teardown failed would make the next Destroy return nil having done
-		// nothing, and make State report StateDestroyed for a VM still
-		// running on the pool — exactly the plausible-looking lie the rest of
-		// this file refuses to tell.
-		return err
+	if v.created {
+		if err := v.teardown(ctx); err != nil {
+			// v.destroyed stays false. Marking the machine destroyed while
+			// teardown failed would make the next Destroy return nil having
+			// done nothing, and make State report StateDestroyed for a VM
+			// still running on the pool — exactly the plausible-looking lie
+			// the rest of this file refuses to tell.
+			return err
+		}
 	}
 	v.destroyed = true
 	return v.closeClient()
