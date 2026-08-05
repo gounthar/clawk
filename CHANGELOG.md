@@ -7,6 +7,8 @@ tagged.
 
 ## Unreleased
 
+## v0.3.0
+
 ### Added
 
 - **Reverse port forwarding: host loopback services, reachable in the guest.**
@@ -147,6 +149,29 @@ tagged.
   agent's login shells silently skipped it and the variables never arrived.
   It is now `0644`, matching the working OAuth-token export
   (clawkwork/clawk#4).
+- **A sandbox authenticated by seeded credentials no longer re-runs onboarding
+  on every boot.** `~/.claude.json` lives on the per-boot disposable rootfs,
+  so the marker clawk-init writes is the whole file claude reads at startup —
+  and it carried `hasCompletedOnboarding` only when a long-lived OAuth token
+  was configured, on the premise that the keychain-credentials path ships its
+  own account metadata. It doesn't, and claude's first-run wizard gates on
+  that flag alone, so a sandbox with a valid `.credentials.json` asked the
+  agent to log in every time. The flag now keys on whether the sandbox boots
+  with usable credentials at all: a token, or a `.credentials.json` already in
+  the state dir. ([#8](https://github.com/clawkwork/clawk/issues/8))
+- **`files ( … )` entries now actually land in the guest.** The in-guest
+  `install` ran as `-o agent -g agent`, but the guest `agent` user has no
+  group of that name — its gid mirrors the host's, where gid 20 is `dialout`
+  on macOS — so `install` failed with `invalid group 'agent'` and the file was
+  never written. Only a non-fatal warning was logged, so `clawk up` reported
+  success while a pushed `~/.netrc` or `~/.kube/config` silently wasn't there.
+  The group is resolved at runtime now.
+- **A bare `allow 10.0.0.0/8` in `clawk.mod` is an error instead of a silent
+  no-op.** It parsed the CIDR as a *domain*, which only ever matches at DNS
+  resolution, so a raw connect to an address in that range was refused despite
+  the rule appearing to permit it. Bare `allow`/`deny` entries that are really
+  an IP or CIDR now fail with a pointer to `allow ip <addr>`, matching what
+  `clawk network allow` already enforced.
 
 ## v0.2.0
 
