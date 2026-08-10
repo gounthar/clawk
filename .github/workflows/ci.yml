@@ -81,8 +81,18 @@ jobs:
           go vet ./...
           go test ./...
 
+      # TEMPORARY — diagnostic, revert before merge.
+      #
+      # This step hangs on macos for this branch while passing in ~10s on both
+      # main and this branch before it was merged with main. Logs are not
+      # retained for a cancelled job and the hang does not reproduce on linux,
+      # so the only way to see which test is stuck is to make Go give up and
+      # dump its goroutines. -timeout 3m turns the hang into a panic naming the
+      # test; -v identifies how far it got. -p 1 removes package-level
+      # parallelism so the output attributes the stall to one package rather
+      # than interleaving several.
       - name: machine module — vet / test
         working-directory: machine
         run: |
           go vet ./...
-          go test ./...
+          go test -v -p 1 -timeout 3m ./...
