@@ -16,14 +16,29 @@ package xapi
 //	                         # self-signed; an unparseable value is an error
 //	                         # rather than a silent default.
 //
-// This reads; it creates nothing and destroys nothing, so it is safe to
-// point at a pool that has real VMs on it. The VM named by TEST_XAPI_VM is
-// only ever asked for its power state. The one thing here that changes any
-// pool state is TestPoolSessionRecovery_Manual ending its own session, which
-// touches no storage and no VM.
+// Everything above reads; it creates nothing and destroys nothing, so it is
+// safe to point at a pool that has real VMs on it. The VM named by
+// TEST_XAPI_VM is only ever asked for its power state. The one thing there
+// that changes any pool state is TestPoolSessionRecovery_Manual ending its
+// own session, which touches no storage and no VM.
+//
+// The storage round-trip is different: it creates VDIs. It therefore has its
+// own switch and does not ride on TEST_XAPI_POOL:
+//
+//	TEST_XAPI_POOL=https://... TEST_XAPI_PASSWORD=... \
+//	TEST_XAPI_SR=<sr-uuid> TEST_XAPI_WRITE=1 \
+//	  go test ./xapi -run TestPoolVDI -v
+//
+// Two variables rather than one is deliberate. Someone pointing the existing
+// read-only suite at a production pool should not discover that the switch
+// they already set has started creating disks — and the SR has to be named
+// explicitly, so the test cannot pick a default and write somewhere nobody
+// chose. It cleans up what it makes, including on failure.
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"strconv"
 	"testing"
@@ -174,4 +189,139 @@ func TestPoolUnimplemented_Manual(t *testing.T) {
 
 	_, err = cl.VMCreate(ctx, VMConfig{NameLabel: "should-not-be-created"})
 	require.ErrorIs(t, err, errNotImplemented)
+}
+
+// writeConfigFromEnv gates the tests that create pool objects. It is
+// deliberately separate from poolConfigFromEnv: the read-only suite must not
+// start writing because someone re-used its variable.
+func writeConfigFromEnv(t *testing.T) (Config, string) {
+	t.Helper()
+	if os.Getenv("TEST_XAPI_WRITE") == "" {
+		t.Skip("set TEST_XAPI_WRITE=1 to run (creates and destroys VDIs on a real SR)")
+	}
+	cfg := poolConfigFromEnv(t)
+	sr := os.Getenv("TEST_XAPI_SR")
+	if sr == "" {
+		t.Skip("set TEST_XAPI_SR to the uuid of the SR to write to")
+	}
+	cfg.SRUUID = sr
+	return cfg, sr
+}
+
+// TestPoolVDIRoundTrip_Manual is build-order step 3: prove a raw disk image
+// survives the trip to the SR and can be cloned.
+//
+// It imports a small pattern-filled image, reads the virtual size back,
+// finds it by name the way a second sandbox would, clones it, and destroys
+// both. The clone is what the per-sandbox disk model rests on, so proving
+// import alone would prove half the step.
+//
+// Cleanup runs through t.Cleanup so that a failure part-way still removes
+// what was made. A test that writes to someone's lab and leaves debris on
+// the failure path is worse than no test.
+func TestPoolVDIRoundTrip_Manual(t *testing.T) {
+	cfg, srUUID := writeConfigFromEnv(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	cl, err := newJSONRPCClient(ctx, cfg)
+	require.NoError(t, err, "login to %s", cfg.URL)
+	// The logout is registered as a cleanup, not deferred, and registered
+	// first so that LIFO ordering runs it last. `defer cl.Close()` looks
+	// equivalent and is not: deferred calls run when the test function
+	// returns, and t.Cleanup runs after that, so the session was already gone
+	// by the time the VDI destroys below fired. That is not a hypothetical —
+	// it leaked two VDIs onto the lab SR on this test's first run, and they
+	// had to be removed by hand.
+	t.Cleanup(func() { _ = cl.Close() })
+
+	// 8 MiB, and a byte pattern rather than zeroes: a sparse-file shortcut
+	// anywhere in the path would still produce a correct-looking size, and
+	// zeroes would not notice.
+	const size = 8 << 20
+	payload := make([]byte, size)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+
+	// A name nobody else would choose, carrying the run so two runs cannot
+	// collide into the duplicate-name error.
+	name := fmt.Sprintf("clawk-test-%d", time.Now().UnixNano())
+
+	golden, err := cl.VDIImportRaw(ctx, srUUID, name, bytes.NewReader(payload), size)
+	require.NoError(t, err, "VDIImportRaw")
+	require.NotEmpty(t, golden)
+	t.Cleanup(func() {
+		// WithoutCancel: cleanup must still run when the test's context has
+		// expired, which is exactly when there is most likely to be debris.
+		if err := cl.VDIDestroy(context.WithoutCancel(ctx), golden); err != nil {
+			t.Errorf("leaked golden VDI %s on the SR: %v", golden, err)
+		}
+	})
+	t.Logf("imported %d bytes as %s (%s)", size, name, golden)
+
+	got, err := cl.vdiVirtualSize(ctx, golden)
+	require.NoError(t, err, "VDI.get_virtual_size")
+	require.Equal(t, int64(size), got,
+		"the pool must report the size we asked for; a mismatch means "+
+			"virtual_size did not survive the wire encoding")
+
+	// The lookup a second sandbox from the same image would do.
+	found, ok, err := cl.VDIFindByName(ctx, srUUID, name)
+	require.NoError(t, err, "VDIFindByName")
+	require.True(t, ok, "the VDI just imported must be findable by name")
+	require.Equal(t, golden, found, "found a different VDI than the one imported")
+
+	_, ok, err = cl.VDIFindByName(ctx, srUUID, name+"-absent")
+	require.NoError(t, err, "a name that is not there is not an error")
+	require.False(t, ok)
+
+	clone, err := cl.VDIClone(ctx, golden)
+	require.NoError(t, err, "VDI.clone")
+	require.NotEmpty(t, clone)
+	require.NotEqual(t, golden, clone, "clone must be a distinct VDI")
+	t.Cleanup(func() {
+		if err := cl.VDIDestroy(context.WithoutCancel(ctx), clone); err != nil {
+			t.Errorf("leaked clone VDI %s on the SR: %v", clone, err)
+		}
+	})
+
+	cloneSize, err := cl.vdiVirtualSize(ctx, clone)
+	require.NoError(t, err)
+	require.Equal(t, int64(size), cloneSize, "the clone must be the same virtual size")
+	t.Logf("cloned %s -> %s", golden, clone)
+}
+
+// TestPoolVDIImportCleansUpOnFailure_Manual proves the cleanup path against a
+// real pool rather than only against the fake: an import that cannot succeed
+// must not leave a VDI wearing the name a later run would adopt as valid.
+//
+// The failure is forced by declaring a size and then supplying fewer bytes,
+// which is the shape a truncated image or a dropped connection takes.
+func TestPoolVDIImportCleansUpOnFailure_Manual(t *testing.T) {
+	cfg, srUUID := writeConfigFromEnv(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	cl, err := newJSONRPCClient(ctx, cfg)
+	require.NoError(t, err, "login to %s", cfg.URL)
+	defer cl.Close()
+
+	name := fmt.Sprintf("clawk-test-short-%d", time.Now().UnixNano())
+	const declared = 4 << 20
+	short := bytes.NewReader(make([]byte, declared/2))
+
+	_, err = cl.VDIImportRaw(ctx, srUUID, name, short, declared)
+	require.Error(t, err, "an import that delivers half its bytes must not report success")
+	t.Logf("import failed as intended: %v", err)
+
+	// Whatever went wrong, nothing may be left behind under that name.
+	_, ok, findErr := cl.VDIFindByName(ctx, srUUID, name)
+	require.NoError(t, findErr, "VDIFindByName after the failed import")
+	if ok {
+		t.Fatal("a VDI survived a failed import under the name a later run " +
+			"would adopt as a valid golden image")
+	}
 }

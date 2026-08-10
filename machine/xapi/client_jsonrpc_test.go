@@ -5,12 +5,16 @@ package xapi
 // pool-dependent versions live in manual_test.go.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -39,6 +43,12 @@ type fakeRPC struct {
 	// handle answers a method; returning (nil, nil) falls through to a
 	// generic "no such method" XAPI error.
 	handle func(method string, params []any) (any, *rpcError)
+
+	// What /import_raw_vdi saw, and what it should answer with.
+	importQuery  url.Values
+	importBody   []byte
+	importLength int64
+	importStatus int
 }
 
 // The fake serves TLS because the transport refuses a cleartext pool URL.
@@ -53,6 +63,10 @@ func newFakeRPC(t *testing.T, handle func(string, []any) (any, *rpcError)) *fake
 }
 
 func (f *fakeRPC) serve(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/import_raw_vdi" {
+		f.serveImport(w, r)
+		return
+	}
 	assert.Equal(f.t, "/jsonrpc", r.URL.Path, "transport must POST to /jsonrpc")
 	assert.Equal(f.t, http.MethodPost, r.Method)
 	assert.Equal(f.t, "application/json", r.Header.Get("Content-Type"))
@@ -83,6 +97,29 @@ func (f *fakeRPC) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	assert.NoError(f.t, json.NewEncoder(w).Encode(resp))
+}
+
+// serveImport stands in for XAPI's /import_raw_vdi endpoint: it records the
+// query it was called with and the bytes it received, then answers 200 the
+// way XAPI does — before the outcome is known, which is the whole reason the
+// transport waits on a task rather than trusting the status line.
+func (f *fakeRPC) serveImport(w http.ResponseWriter, r *http.Request) {
+	assert.Equal(f.t, http.MethodPut, r.Method, "raw import must be a PUT")
+
+	body, err := io.ReadAll(r.Body)
+	assert.NoError(f.t, err)
+
+	f.mu.Lock()
+	f.importQuery = r.URL.Query()
+	f.importBody = body
+	f.importLength = r.ContentLength
+	status := f.importStatus
+	f.mu.Unlock()
+
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
 }
 
 // requests returns a copy of what the handler has recorded so far.
@@ -296,10 +333,370 @@ func TestJSONRPCUnimplementedMethodsReturnError(t *testing.T) {
 	_, err := cl.VMCreate(ctx, VMConfig{})
 	require.ErrorIs(t, err, errNotImplemented)
 	require.ErrorIs(t, cl.VMStart(ctx, "ref"), errNotImplemented)
-	_, err = cl.VDIClone(ctx, "vdi")
-	require.ErrorIs(t, err, errNotImplemented)
+	require.ErrorIs(t, cl.VBDAttach(ctx, "vm", "vdi", "0", false), errNotImplemented)
+
+	// The VDI calls used to be in this list. They are implemented now, so
+	// asserting they are not would go green again the day one regressed to a
+	// stub. VDIClone's behaviour is covered by TestJSONRPCVDIClone below.
 
 	require.Len(t, f.requests(), 1, "unimplemented calls must not reach the pool")
+}
+
+// --- storage --------------------------------------------------------------
+
+// storagePool answers the calls VDIImportRaw makes. taskStatus decides what
+// the import's task reports, which is the only thing that says whether the
+// import worked: XAPI writes its 200 before the data has landed.
+type storagePool struct {
+	mu         sync.Mutex
+	taskStatus string
+	created    map[string]any // the VDI.create record, as received
+	destroyed  []string
+	vdisByName map[string][]string // name-label -> refs
+	vdiSR      map[string]string   // vdi ref -> SR ref
+
+	// logins counts session.login_with_password and names each session, so a
+	// test can tell which one a request carried.
+	logins int
+	// expireBeforeTaskCreate makes the first task.create answer
+	// SESSION_INVALID, which is what an expired session looks like and what
+	// drives sessionCall's re-login.
+	expireBeforeTaskCreate bool
+	expired                bool
+	// destroyInUseOnce makes the first VDI.destroy answer VDI_IN_USE, which
+	// is what a real pool does while it is still releasing the disk.
+	destroyInUseOnce bool
+	destroyRefused   bool
+}
+
+func newStoragePool() *storagePool {
+	return &storagePool{
+		taskStatus: "success",
+		vdisByName: map[string][]string{},
+		vdiSR:      map[string]string{},
+	}
+}
+
+func (p *storagePool) handle(method string, params []any) (any, *rpcError) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	switch method {
+	case "session.login_with_password":
+		p.logins++
+		return fmt.Sprintf("OpaqueRef:session-%d", p.logins), nil
+	case "SR.get_by_uuid":
+		if params[1] == "sr-missing" {
+			return nil, &rpcError{Code: 1, Message: "UUID_INVALID"}
+		}
+		return "OpaqueRef:sr", nil
+	case "VDI.create":
+		rec, ok := params[1].(map[string]any)
+		if !ok {
+			return nil, &rpcError{Code: 1, Message: "FIELD_TYPE_ERROR"}
+		}
+		p.created = rec
+		return "OpaqueRef:vdi-new", nil
+	case "VDI.destroy":
+		if p.destroyInUseOnce && !p.destroyRefused {
+			p.destroyRefused = true
+			return nil, &rpcError{Code: 1, Message: "VDI_IN_USE"}
+		}
+		p.destroyed = append(p.destroyed, params[1].(string))
+		return "", nil
+	case "VDI.clone":
+		return "OpaqueRef:clone-of-" + params[1].(string), nil
+	case "VDI.get_by_name_label":
+		return p.vdisByName[params[1].(string)], nil
+	case "VDI.get_SR":
+		return p.vdiSR[params[1].(string)], nil
+	case "VDI.get_virtual_size":
+		return 4096, nil
+	case "task.create":
+		if p.expireBeforeTaskCreate && !p.expired {
+			p.expired = true
+			return nil, &rpcError{Code: 1, Message: "SESSION_INVALID"}
+		}
+		return "OpaqueRef:task", nil
+	case "task.cancel":
+		return "", nil
+	case "task.get_status":
+		return p.taskStatus, nil
+	case "task.get_error_info":
+		return []string{"SR_BACKEND_FAILURE_44", "", "no space left"}, nil
+	case "task.destroy":
+		return "", nil
+	case "session.logout":
+		return "", nil
+	}
+	return nil, nil
+}
+
+func TestJSONRPCVDIImportRaw(t *testing.T) {
+	p := newStoragePool()
+	f := newFakeRPC(t, p.handle)
+	cl := dialFake(t, f)
+
+	payload := bytes.Repeat([]byte{0xAB}, 4096)
+	ref, err := cl.VDIImportRaw(context.Background(), "sr-uuid", "clawk-sha256-abc",
+		bytes.NewReader(payload), int64(len(payload)))
+	require.NoError(t, err)
+	require.Equal(t, VDIRef("OpaqueRef:vdi-new"), ref)
+
+	// The record XAPI was asked to create.
+	p.mu.Lock()
+	rec, destroyed := p.created, append([]string(nil), p.destroyed...)
+	p.mu.Unlock()
+	require.Equal(t, "clawk-sha256-abc", rec["name_label"])
+	require.Equal(t, "OpaqueRef:sr", rec["SR"])
+	require.Equal(t, "user", rec["type"])
+	require.Equal(t, false, rec["read_only"])
+	// virtual_size must be a JSON number. A string is accepted by
+	// encoding/json and rejected by a real pool, which is a bad place to find
+	// out, so it is pinned here.
+	require.Equal(t, float64(4096), rec["virtual_size"],
+		"virtual_size must go on the wire as a number, not a string")
+	require.Empty(t, destroyed, "a successful import must not destroy its VDI")
+
+	// The PUT itself.
+	f.mu.Lock()
+	q, body, length := f.importQuery, f.importBody, f.importLength
+	f.mu.Unlock()
+	require.Equal(t, payload, body, "the bytes must arrive intact")
+	require.Equal(t, int64(len(payload)), length,
+		"Content-Length must be set, not chunked encoding")
+	require.Equal(t, "raw", q.Get("format"))
+	require.Equal(t, "OpaqueRef:vdi-new", q.Get("vdi"))
+	// storagePool numbers its sessions so a re-login can be told apart from
+	// the first login; with no expiry forced, this is the only one.
+	require.Equal(t, "OpaqueRef:session-1", q.Get("session_id"))
+	require.Equal(t, "OpaqueRef:task", q.Get("task_id"),
+		"the transport must pass its own task, or the outcome is unobservable")
+
+	require.Contains(t, f.methods(), "task.destroy", "the task must be cleaned up")
+}
+
+// XAPI answers 200 before it knows whether the import worked. The task is
+// where the truth is, so a failing task must fail the call — and the VDI it
+// created must not be left behind wearing the name a later run would adopt.
+func TestJSONRPCVDIImportRawFailsWhenTaskFails(t *testing.T) {
+	p := newStoragePool()
+	p.taskStatus = "failure"
+	f := newFakeRPC(t, p.handle)
+	cl := dialFake(t, f)
+
+	_, err := cl.VDIImportRaw(context.Background(), "sr-uuid", "clawk-img",
+		bytes.NewReader(make([]byte, 512)), 512)
+	require.Error(t, err, "a 200 with a failed task is not a successful import")
+	require.Contains(t, err.Error(), "no space left", "XAPI's error_info must survive")
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.Equal(t, []string{"OpaqueRef:vdi-new"}, p.destroyed,
+		"the half-written VDI must be destroyed, or VDIFindByName adopts it next run")
+}
+
+// --- findings from the local reviewers on PR #13 ------------------------
+
+// The import is not an RPC, so sessionCall's re-login-and-retry cannot cover
+// it. That makes *when* the session ref is read load-bearing: every RPC
+// before the PUT (SR lookup, VDI.create, task.create) can trigger a
+// re-login, and a ref captured before them would go into the URL already
+// dead, with nothing to catch it.
+func TestJSONRPCVDIImportRawUsesTheSessionAfterRelogin(t *testing.T) {
+	p := newStoragePool()
+	p.expireBeforeTaskCreate = true
+	f := newFakeRPC(t, p.handle)
+	cl := dialFake(t, f)
+
+	_, err := cl.VDIImportRaw(context.Background(), "sr-uuid", "img",
+		bytes.NewReader(make([]byte, 512)), 512)
+	require.NoError(t, err)
+
+	p.mu.Lock()
+	logins := p.logins
+	p.mu.Unlock()
+	require.Equal(t, 2, logins, "the expired session must have forced exactly one re-login")
+
+	f.mu.Lock()
+	got := f.importQuery.Get("session_id")
+	f.mu.Unlock()
+	require.Equal(t, "OpaqueRef:session-2", got,
+		"the PUT carried the session ref from before the re-login, which the pool has expired")
+}
+
+// A task the client stops watching keeps running on the pool and keeps
+// writing into the VDI. Destroying that VDI is the caller's next move and
+// cannot succeed while the import still holds it, so the task has to be
+// cancelled first — otherwise the half-written disk survives under the name
+// a later VDIFindByName would adopt.
+func TestJSONRPCVDIImportRawCancelsTaskBeforeDestroy(t *testing.T) {
+	p := newStoragePool()
+	p.taskStatus = "failure"
+	f := newFakeRPC(t, p.handle)
+	cl := dialFake(t, f)
+
+	_, err := cl.VDIImportRaw(context.Background(), "sr-uuid", "img",
+		bytes.NewReader(make([]byte, 512)), 512)
+	require.Error(t, err)
+
+	methods := f.methods()
+	cancelAt, destroyAt := -1, -1
+	for i, m := range methods {
+		if m == "task.cancel" && cancelAt < 0 {
+			cancelAt = i
+		}
+		if m == "task.destroy" && destroyAt < 0 {
+			destroyAt = i
+		}
+	}
+	require.GreaterOrEqual(t, cancelAt, 0, "a failed import must cancel its task: %v", methods)
+	require.GreaterOrEqual(t, destroyAt, 0, "the task must still be destroyed")
+	require.Less(t, cancelAt, destroyAt, "cancel must come before destroy")
+}
+
+// The cancel is for the failure path only. Cancelling a task that already
+// succeeded would be noise in the pool's log at best, and at worst would
+// look to an operator like the import was aborted.
+func TestJSONRPCVDIImportRawDoesNotCancelOnSuccess(t *testing.T) {
+	p := newStoragePool()
+	f := newFakeRPC(t, p.handle)
+	cl := dialFake(t, f)
+
+	_, err := cl.VDIImportRaw(context.Background(), "sr-uuid", "img",
+		bytes.NewReader(make([]byte, 512)), 512)
+	require.NoError(t, err)
+	require.NotContains(t, f.methods(), "task.cancel",
+		"a successful import must not cancel its own task")
+	require.Contains(t, f.methods(), "task.destroy")
+}
+
+// plainSeeker is an io.ReadSeeker that is none of the three concrete types
+// net/http special-cases. NewRequest sets GetBody by itself for
+// *bytes.Reader, *bytes.Buffer and *strings.Reader, so a test using one of
+// those would pass with or without the fix. A real import streams an
+// *os.File, which gets no such help.
+type plainSeeker struct{ r *bytes.Reader }
+
+func (p plainSeeker) Read(b []byte) (int, error) { return p.r.Read(b) }
+func (p plainSeeker) Seek(off int64, whence int) (int64, error) {
+	return p.r.Seek(off, whence)
+}
+
+// XAPI redirects this endpoint to the host the SR is attached to, which on a
+// multi-host pool is routinely not the master. Go can only follow a redirect
+// whose body it can replay, and with a plain io.Reader it cannot: the
+// request fails with a ContentLength mismatch that mentions nothing about
+// redirects. Single-host lab pools never show this.
+func TestJSONRPCVDIImportRawFollowsPoolRedirect(t *testing.T) {
+	p := newStoragePool()
+	f := newFakeRPC(t, p.handle)
+
+	// Redirect the first import attempt back to the same server, which is
+	// what a pool does when the SR lives on another host.
+	var redirected atomic.Bool
+	inner := f.srv.Config.Handler
+	f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/import_raw_vdi" && redirected.CompareAndSwap(false, true) {
+			http.Redirect(w, r, f.srv.URL+"/import_raw_vdi?"+r.URL.RawQuery, http.StatusTemporaryRedirect)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	})
+
+	payload := bytes.Repeat([]byte{0x5A}, 2048)
+	_, err := cl2(t, f).VDIImportRaw(context.Background(), "sr-uuid", "img",
+		plainSeeker{bytes.NewReader(payload)}, int64(len(payload)))
+	require.NoError(t, err, "the transport must follow the pool's redirect to the SR's host")
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	require.Equal(t, payload, f.importBody, "the body must be replayed intact after the redirect")
+}
+
+// cl2 dials after the handler has been wrapped, so the login RPC goes
+// through the wrapper too.
+func cl2(t *testing.T, f *fakeRPC) *jsonrpcClient { return dialFake(t, f) }
+
+func TestJSONRPCVDIImportRawRejectsBadSize(t *testing.T) {
+	f := newFakeRPC(t, newStoragePool().handle)
+	cl := dialFake(t, f)
+
+	_, err := cl.VDIImportRaw(context.Background(), "sr-uuid", "img", bytes.NewReader(nil), 0)
+	require.Error(t, err)
+	require.Len(t, f.requests(), 1, "a bad size must not reach the pool")
+}
+
+func TestJSONRPCVDIFindByName(t *testing.T) {
+	p := newStoragePool()
+	p.vdisByName["wanted"] = []string{"OpaqueRef:a", "OpaqueRef:b"}
+	p.vdisByName["dupes"] = []string{"OpaqueRef:c", "OpaqueRef:d"}
+	// a is in our SR, b is in a different one; c and d are both in ours.
+	p.vdiSR = map[string]string{
+		"OpaqueRef:a": "OpaqueRef:sr",
+		"OpaqueRef:b": "OpaqueRef:other-sr",
+		"OpaqueRef:c": "OpaqueRef:sr",
+		"OpaqueRef:d": "OpaqueRef:sr",
+	}
+	f := newFakeRPC(t, p.handle)
+	cl := dialFake(t, f)
+	ctx := context.Background()
+
+	t.Run("found in this SR only", func(t *testing.T) {
+		ref, ok, err := cl.VDIFindByName(ctx, "sr-uuid", "wanted")
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, VDIRef("OpaqueRef:a"), ref,
+			"a match in another SR must not be returned")
+	})
+
+	t.Run("absent", func(t *testing.T) {
+		_, ok, err := cl.VDIFindByName(ctx, "sr-uuid", "nothing")
+		require.NoError(t, err)
+		require.False(t, ok, "absence is not an error; it means import it")
+	})
+
+	t.Run("duplicates refuse to guess", func(t *testing.T) {
+		_, ok, err := cl.VDIFindByName(ctx, "sr-uuid", "dupes")
+		require.Error(t, err)
+		require.False(t, ok)
+		require.Contains(t, err.Error(), "refusing to guess")
+	})
+}
+
+func TestJSONRPCVDIClone(t *testing.T) {
+	f := newFakeRPC(t, newStoragePool().handle)
+	cl := dialFake(t, f)
+
+	ref, err := cl.VDIClone(context.Background(), "OpaqueRef:golden")
+	require.NoError(t, err)
+	require.Equal(t, VDIRef("OpaqueRef:clone-of-OpaqueRef:golden"), ref)
+}
+
+func TestJSONRPCVDIDestroy(t *testing.T) {
+	p := newStoragePool()
+	f := newFakeRPC(t, p.handle)
+	cl := dialFake(t, f)
+
+	require.NoError(t, cl.VDIDestroy(context.Background(), "OpaqueRef:doomed"))
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.Equal(t, []string{"OpaqueRef:doomed"}, p.destroyed)
+}
+
+// The import endpoint must be built from the same validated parts as the RPC
+// endpoint. If it were assembled from the raw config string, the https
+// guarantee would hold for RPC and not for the disk upload.
+func TestJSONRPCImportEndpointSharesValidation(t *testing.T) {
+	u, err := poolBase("https://pool.example/xapi/")
+	require.NoError(t, err)
+	require.Equal(t, "https://pool.example/xapi/jsonrpc", u.JoinPath("jsonrpc").String())
+	require.Equal(t, "https://pool.example/xapi/import_raw_vdi", u.JoinPath("import_raw_vdi").String())
+
+	for _, bad := range []string{"http://pool", "https://root:pw@pool", "pool.example"} {
+		_, err := poolBase(bad)
+		require.Error(t, err, "poolBase must reject %q", bad)
+	}
 }
 
 // sessionPool is a fake pool that tracks which session ref is currently
@@ -548,4 +945,27 @@ func TestJSONRPCRefusesRedirectOffHTTPS(t *testing.T) {
 	})
 	require.ErrorContains(t, err, "refusing redirect to non-https")
 	require.NotContains(t, err.Error(), "hunter2")
+}
+
+// XAPI frees a VDI asynchronously after an import ends, so the destroy that
+// follows a failed import can answer VDI_IN_USE and succeed moments later.
+// Observed against a real pool: the first attempt failed and the disk was
+// left behind under a name the next run would have adopted.
+func TestJSONRPCVDIImportRawRetriesDestroyWhileInUse(t *testing.T) {
+	p := newStoragePool()
+	p.taskStatus = "failure"
+	p.destroyInUseOnce = true
+	f := newFakeRPC(t, p.handle)
+	cl := dialFake(t, f)
+
+	_, err := cl.VDIImportRaw(context.Background(), "sr-uuid", "img",
+		bytes.NewReader(make([]byte, 512)), 512)
+	require.Error(t, err, "the import itself still failed")
+	require.NotContains(t, err.Error(), "could not be destroyed",
+		"a VDI_IN_USE that clears on retry is not a leak and must not be reported as one")
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.Equal(t, []string{"OpaqueRef:vdi-new"}, p.destroyed,
+		"the VDI must be destroyed once the pool releases it")
 }

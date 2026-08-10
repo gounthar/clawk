@@ -60,8 +60,11 @@ const (
 // client's lifetime rather than being discarded after the first login.
 type jsonrpcClient struct {
 	endpoint string
-	http     *http.Client
-	nextID   atomic.Uint64
+	// base is the pool root the non-RPC endpoints hang off. Held as a value
+	// so callers building a URL from it cannot mutate the client's copy.
+	base   url.URL
+	http   *http.Client
+	nextID atomic.Uint64
 
 	// Credentials for re-login. Config already holds these for the life of
 	// the process (Configure is process-global), so keeping them here
@@ -85,9 +88,14 @@ type jsonrpcClient struct {
 
 var _ Client = (*jsonrpcClient)(nil)
 
-// poolEndpoint validates a pool URL and returns the JSON-RPC endpoint to POST
-// to. Split out of newJSONRPCClient so the rules can be tested without
-// dialling anything.
+// poolBase validates a pool URL and reduces it to the parts every endpoint on
+// that pool is built from. Split out of newJSONRPCClient so the rules can be
+// tested without dialling anything.
+//
+// There are two endpoints, not one: RPC at /jsonrpc, and the raw VDI import at
+// /import_raw_vdi, which is a PUT rather than an RPC. Both are derived from
+// this, so the https guarantee and the credential rejection below cannot hold
+// for one path and quietly not the other.
 //
 // Cleartext is refused outright. login sends the password, and every call
 // after it sends the session ref; on http:// both cross the wire in the
@@ -98,7 +106,7 @@ var _ Client = (*jsonrpcClient)(nil)
 // Parsing rather than string-matching also means a URL with no scheme fails
 // naming the field, instead of surfacing later out of
 // http.NewRequestWithContext as an error mentioning neither Config nor URL.
-func poolEndpoint(raw string) (string, error) {
+func poolBase(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		// Report the reason without the URL. *url.Error stringifies to
@@ -110,12 +118,12 @@ func poolEndpoint(raw string) (string, error) {
 		// no caller can unwrap back to something holding the raw string.
 		var ue *url.Error
 		if errors.As(err, &ue) {
-			return "", fmt.Errorf("xapi: Config.URL is not a URL: %v", ue.Err)
+			return nil, fmt.Errorf("xapi: Config.URL is not a URL: %v", ue.Err)
 		}
-		return "", errors.New("xapi: Config.URL is not a URL")
+		return nil, errors.New("xapi: Config.URL is not a URL")
 	}
 	if u.Scheme != "https" || u.Host == "" {
-		return "", fmt.Errorf("xapi: Config.URL must be https://host, got %q", raw)
+		return nil, fmt.Errorf("xapi: Config.URL must be https://host, got %q", raw)
 	}
 
 	// Refuse the parts of a URL a pool endpoint has no use for, rather than
@@ -123,22 +131,31 @@ func poolEndpoint(raw string) (string, error) {
 	// Config.Username and Config.Password, not in a string kept as the
 	// endpoint field and printed by anything that logs it.
 	if u.User != nil {
-		return "", errors.New(
+		return nil, errors.New(
 			"xapi: Config.URL must not carry credentials; use Config.Username and Config.Password")
 	}
 	if u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("xapi: Config.URL must not carry a query or fragment, got %q", raw)
+		return nil, fmt.Errorf("xapi: Config.URL must not carry a query or fragment, got %q", raw)
 	}
 
 	// Build from the parsed parts. Appending to the raw string glued the path
 	// onto whatever came last, so "https://pool?x=1" produced
 	// "https://pool?x=1/jsonrpc". The checks above already make that
 	// unreachable; constructing this way keeps it so if they ever loosen.
-	return (&url.URL{
+	return &url.URL{
 		Scheme: u.Scheme,
 		Host:   u.Host,
-		Path:   strings.TrimSuffix(u.Path, "/") + "/jsonrpc",
-	}).String(), nil
+		Path:   strings.TrimSuffix(u.Path, "/"),
+	}, nil
+}
+
+// poolEndpoint returns the JSON-RPC endpoint to POST to.
+func poolEndpoint(raw string) (string, error) {
+	u, err := poolBase(raw)
+	if err != nil {
+		return "", err
+	}
+	return u.JoinPath("jsonrpc").String(), nil
 }
 
 // newJSONRPCClient dials the pool and logs in. It returns the concrete type
@@ -152,13 +169,14 @@ func newJSONRPCClient(ctx context.Context, c Config) (*jsonrpcClient, error) {
 		return nil, errors.New("xapi: Config.Username is required")
 	}
 
-	endpoint, err := poolEndpoint(c.URL)
+	base, err := poolBase(c.URL)
 	if err != nil {
 		return nil, err
 	}
 
 	cl := &jsonrpcClient{
-		endpoint: endpoint,
+		endpoint: base.JoinPath("jsonrpc").String(),
+		base:     *base,
 		username: c.Username,
 		password: c.Password,
 		http: &http.Client{
@@ -455,6 +473,338 @@ func (c *jsonrpcClient) VMByNameLabel(ctx context.Context, label string) (VMRef,
 	}
 }
 
+// --- storage --------------------------------------------------------------
+
+// taskPoll is how often an in-progress XAPI task is re-read. The import is
+// the only caller and it runs for as long as a disk takes to stream, so this
+// trades a little latency at the end for not hammering the pool throughout.
+const taskPoll = 500 * time.Millisecond
+
+// srByUUID resolves the SR uuid an operator configured into the ref the API
+// wants. Config carries a uuid because that is what xe and the XO UI show;
+// refs are per-session and cannot be written into a config file.
+func (c *jsonrpcClient) srByUUID(ctx context.Context, uuid string) (string, error) {
+	if uuid == "" {
+		return "", errors.New("xapi: SR uuid is empty")
+	}
+	var ref string
+	if err := c.sessionCall(ctx, "SR.get_by_uuid", &ref, uuid); err != nil {
+		return "", fmt.Errorf("xapi: no SR with uuid %s: %w", uuid, err)
+	}
+	return ref, nil
+}
+
+// vdiCreate makes an empty VDI of the given virtual size.
+//
+// virtual_size goes on the wire as a JSON number. XAPI's JSON-RPC renders
+// Int as a number rather than the string some of its other bindings use,
+// confirmed against a live pool (SR.get_physical_size came back 207028920320,
+// not "207028920320"). Sending a string here is accepted by encoding/json and
+// rejected by the pool, which is a confusing place to find out.
+func (c *jsonrpcClient) vdiCreate(ctx context.Context, srRef, name string, sizeBytes int64) (VDIRef, error) {
+	rec := map[string]any{
+		"name_label":       name,
+		"name_description": "clawk rootfs image",
+		"SR":               srRef,
+		"virtual_size":     sizeBytes,
+		"type":             "user",
+		"sharable":         false,
+		"read_only":        false,
+		"other_config":     map[string]string{},
+	}
+	var ref string
+	if err := c.sessionCall(ctx, "VDI.create", &ref, rec); err != nil {
+		return "", err
+	}
+	return VDIRef(ref), nil
+}
+
+// VDIImportRaw creates a VDI and streams a raw image into it.
+//
+// Two things about this call are not like the others in this file. It is not
+// an RPC — the data goes to XAPI's /import_raw_vdi endpoint as an HTTP PUT —
+// and its result is not in the HTTP response. XAPI writes the 200 header
+// before the transfer finishes, so a 200 means "the request was accepted",
+// not "the disk is on the SR". The outcome arrives through a Task, which is
+// why one is created here and waited on rather than letting XAPI make its own
+// and throwing away the handle.
+//
+// A failure part-way through destroys the VDI it created. Leaving it would be
+// worse than useless: it keeps the name, so the next run's VDIFindByName would
+// adopt a half-written disk as a valid golden image.
+func (c *jsonrpcClient) VDIImportRaw(ctx context.Context, srUUID, name string, r io.Reader, sizeBytes int64) (VDIRef, error) {
+	if sizeBytes <= 0 {
+		return "", fmt.Errorf("xapi: VDIImportRaw needs a positive size, got %d", sizeBytes)
+	}
+	srRef, err := c.srByUUID(ctx, srUUID)
+	if err != nil {
+		return "", err
+	}
+	vdi, err := c.vdiCreate(ctx, srRef, name, sizeBytes)
+	if err != nil {
+		return "", err
+	}
+
+	if err := c.importRawInto(ctx, vdi, r, sizeBytes); err != nil {
+		// WithoutCancel: the usual reason to be here is a cancelled or
+		// expired context, and that is exactly when the cleanup still has to
+		// happen. A destroy that also fails is reported alongside rather than
+		// replacing the original error, which is the one that explains it.
+		if derr := c.destroyAfterFailedImport(context.WithoutCancel(ctx), vdi); derr != nil {
+			return "", fmt.Errorf("%w (and the partial VDI %s could not be destroyed: %v)",
+				err, vdi, derr)
+		}
+		return "", err
+	}
+	return vdi, nil
+}
+
+// destroyAfterFailedImport removes a VDI whose import did not complete.
+//
+// XAPI frees the disk asynchronously. The import ending — cancelled, failed,
+// or with the connection dropped under it — does not mean the VDI is
+// released, and a destroy issued straight away answers VDI_IN_USE. This is
+// not theoretical: against XCP-ng 8.3 the immediate destroy failed and the
+// same destroy succeeded moments later, leaving a disk behind under the name
+// the next VDIFindByName would adopt.
+//
+// So retry for a bounded window. Reporting a leak that is really a race
+// would send whoever reads the error looking in the wrong place, and leaving
+// the disk is the failure this whole path exists to prevent.
+func (c *jsonrpcClient) destroyAfterFailedImport(ctx context.Context, vdi VDIRef) error {
+	const (
+		attempts = 12
+		delay    = 500 * time.Millisecond
+	)
+	var err error
+	for i := 0; i < attempts; i++ {
+		err = c.VDIDestroy(ctx, vdi)
+		if err == nil || !isVDIInUse(err) {
+			return err
+		}
+		time.Sleep(delay)
+	}
+	return fmt.Errorf("%w (still in use after %s)", err, time.Duration(attempts)*delay)
+}
+
+// isVDIInUse reports whether err is XAPI's VDI_IN_USE, which after a failed
+// import means "not yet released" rather than "someone else has it".
+func isVDIInUse(err error) bool {
+	var re *rpcError
+	return errors.As(err, &re) && re.Message == "VDI_IN_USE"
+}
+
+// importRawInto streams r into an existing VDI and waits for XAPI's task to
+// report the result.
+func (c *jsonrpcClient) importRawInto(ctx context.Context, vdi VDIRef, r io.Reader, sizeBytes int64) error {
+	task, err := c.taskCreate(ctx, "clawk.VDIImportRaw", string(vdi))
+	if err != nil {
+		return err
+	}
+
+	// Read the session *after* task.create, not before.
+	//
+	// taskCreate goes through sessionCall, which re-logs-in and retries when
+	// the pool reports SESSION_INVALID. A ref read before that call can
+	// therefore be dead by the time it reaches this URL, and nothing would
+	// catch it: the import is not an RPC, so sessionCall's retry does not
+	// cover it, and XAPI would simply refuse the PUT. Reading it here closes
+	// the window that every preceding RPC opens.
+	session, _ := c.currentSession()
+
+	imported := false
+	defer func() {
+		// Cleanup runs on a context that cannot be cancelled: the usual way
+		// to get here is a cancelled or expired one, and that is exactly when
+		// the pool still needs telling.
+		cleanupCtx := context.WithoutCancel(ctx)
+		if !imported {
+			// Cancel before destroying. A task the client stopped watching is
+			// still running server-side, still writing into the VDI, and the
+			// caller's next move is to destroy that VDI — which cannot
+			// succeed while an import still holds it. Without this, a
+			// cancelled import leaves the half-written disk behind wearing
+			// the name a later VDIFindByName would adopt.
+			_ = c.sessionCall(cleanupCtx, "task.cancel", nil, task)
+		}
+		// Best effort: a leaked task is a row in the pool's task list, not a
+		// consumed resource, and it must not mask the import's own error.
+		_ = c.sessionCall(cleanupCtx, "task.destroy", nil, task)
+	}()
+
+	if session == "" {
+		return errNoSession
+	}
+
+	u := c.base
+	u.Path = u.Path + "/import_raw_vdi"
+	// The session ref travels in the query string because that is where this
+	// endpoint takes it. It is a bearer token in a URL, so it can reach a
+	// proxy log; the connection is https and the ref is short-lived, and
+	// there is no header-based alternative on this endpoint.
+	u.RawQuery = url.Values{
+		"session_id": {session},
+		"task_id":    {task},
+		"vdi":        {string(vdi)},
+		"format":     {"raw"},
+	}.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), r)
+	if err != nil {
+		return fmt.Errorf("xapi: import_raw_vdi: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	// Declaring the length sends Content-Length instead of chunked encoding,
+	// which this endpoint is documented against HTTP/1.0 for. It also makes a
+	// short reader a hard error from net/http rather than a VDI silently
+	// missing its tail.
+	req.ContentLength = sizeBytes
+
+	// A pool redirects this endpoint to the host the SR is actually attached
+	// to, which on any multi-host pool is routinely not the master. Go can
+	// only follow a redirect it can replay the body for, and with a plain
+	// io.Reader GetBody is nil, so the redirect fails with a confusing
+	// ContentLength mismatch rather than anything mentioning redirects.
+	// Callers pass a file or a bytes.Reader, both seekable.
+	if rs, ok := r.(io.ReadSeeker); ok {
+		if start, serr := rs.Seek(0, io.SeekCurrent); serr == nil {
+			req.GetBody = func() (io.ReadCloser, error) {
+				if _, err := rs.Seek(start, io.SeekStart); err != nil {
+					return nil, err
+				}
+				return io.NopCloser(rs), nil
+			}
+		}
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("xapi: import_raw_vdi: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("xapi: import_raw_vdi: HTTP %s: %s", resp.Status, snippet(body))
+	}
+
+	if err := c.awaitTask(ctx, task); err != nil {
+		return err
+	}
+	imported = true
+	return nil
+}
+
+// taskCreate registers a Task the pool will report an operation's outcome on.
+func (c *jsonrpcClient) taskCreate(ctx context.Context, label, description string) (string, error) {
+	var ref string
+	if err := c.sessionCall(ctx, "task.create", &ref, label, description); err != nil {
+		return "", err
+	}
+	return ref, nil
+}
+
+// awaitTask blocks until a task leaves the pending state, and turns anything
+// other than success into an error carrying XAPI's error_info.
+func (c *jsonrpcClient) awaitTask(ctx context.Context, task string) error {
+	for {
+		var status string
+		if err := c.sessionCall(ctx, "task.get_status", &status, task); err != nil {
+			return fmt.Errorf("xapi: reading task status: %w", err)
+		}
+		switch status {
+		case "success":
+			return nil
+		case "pending":
+			// keep waiting
+		default:
+			// failure, cancelling, cancelled. error_info is XAPI's own
+			// description and is far more use than the status word alone.
+			var info []string
+			if err := c.sessionCall(ctx, "task.get_error_info", &info, task); err != nil || len(info) == 0 {
+				return fmt.Errorf("xapi: task ended %s", status)
+			}
+			return fmt.Errorf("xapi: task ended %s: %s", status, strings.Join(info, " "))
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(taskPoll):
+		}
+	}
+}
+
+// VDIFindByName looks for a VDI by name-label within one SR, which is how the
+// backend avoids re-importing an image it already has.
+//
+// Name-labels are not unique in XAPI, so two matches in the same SR are an
+// error rather than a coin toss — the same rule VMByNameLabel follows. The
+// caller keys these on an image digest, so a duplicate means something else
+// is writing into the SR under our naming scheme, and picking one at random
+// would attach an unknown disk to a sandbox.
+func (c *jsonrpcClient) VDIFindByName(ctx context.Context, srUUID, name string) (VDIRef, bool, error) {
+	srRef, err := c.srByUUID(ctx, srUUID)
+	if err != nil {
+		return "", false, err
+	}
+	var refs []string
+	if err := c.sessionCall(ctx, "VDI.get_by_name_label", &refs, name); err != nil {
+		return "", false, err
+	}
+
+	var hits []string
+	for _, ref := range refs {
+		var sr string
+		if err := c.sessionCall(ctx, "VDI.get_SR", &sr, ref); err != nil {
+			return "", false, err
+		}
+		if sr == srRef {
+			hits = append(hits, ref)
+		}
+	}
+
+	switch len(hits) {
+	case 0:
+		return "", false, nil
+	case 1:
+		return VDIRef(hits[0]), true, nil
+	default:
+		return "", false, fmt.Errorf(
+			"xapi: %d VDIs share the name-label %q in SR %s; refusing to guess",
+			len(hits), name, srUUID)
+	}
+}
+
+// VDIClone makes a writable copy. On a file-based SR (ext, NFS, XOSTOR) this
+// is a fast copy-on-write clone, which is the assumption the per-sandbox disk
+// model rests on; on LVM it is a full copy and will be slow.
+func (c *jsonrpcClient) VDIClone(ctx context.Context, ref VDIRef) (VDIRef, error) {
+	var out string
+	// VDI.clone takes a driver_params map. Empty is the documented default.
+	if err := c.sessionCall(ctx, "VDI.clone", &out, string(ref), map[string]string{}); err != nil {
+		return "", err
+	}
+	return VDIRef(out), nil
+}
+
+func (c *jsonrpcClient) VDIDestroy(ctx context.Context, ref VDIRef) error {
+	return c.sessionCall(ctx, "VDI.destroy", nil, string(ref))
+}
+
+// vdiVirtualSize reads VDI.virtual_size.
+//
+// Deliberately not on the Client interface, for the same reason as
+// VMByNameLabel: the backend never needs it, but a test that has just
+// imported a disk does, to prove the size that arrived is the size it asked
+// for rather than trusting that the call returned nil.
+func (c *jsonrpcClient) vdiVirtualSize(ctx context.Context, ref VDIRef) (int64, error) {
+	var n int64
+	if err := c.sessionCall(ctx, "VDI.get_virtual_size", &n, string(ref)); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // --- not yet implemented --------------------------------------------------
 //
 // Each of these is a later step in the build order. They return an error so
@@ -479,19 +829,6 @@ func (c *jsonrpcClient) VMCheckpoint(context.Context, VMRef, string) (SnapshotRe
 func (c *jsonrpcClient) VMGuestIP(context.Context, VMRef, string) (string, error) {
 	return "", errNotImplemented
 }
-
-func (c *jsonrpcClient) VDIImportRaw(context.Context, string, string, io.Reader, int64) (VDIRef, error) {
-	return "", errNotImplemented
-}
-
-func (c *jsonrpcClient) VDIFindByName(context.Context, string, string) (VDIRef, bool, error) {
-	return "", false, errNotImplemented
-}
-
-func (c *jsonrpcClient) VDIClone(context.Context, VDIRef) (VDIRef, error) {
-	return "", errNotImplemented
-}
-func (c *jsonrpcClient) VDIDestroy(context.Context, VDIRef) error { return errNotImplemented }
 
 func (c *jsonrpcClient) VBDAttach(context.Context, VMRef, VDIRef, string, bool) error {
 	return errNotImplemented
