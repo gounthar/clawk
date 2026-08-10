@@ -5,8 +5,9 @@ established by investigation rather than by reading a spec, and each of them
 invalidates something that looks obvious. They are written down because the
 cost of rediscovering them is a VM that silently never reaches a kernel.
 
-Everything below was checked on 2026-08-10 against XCP-ng 8.3.0 / XAPI 26.1.
-All pool access was read-only: session login, getters, logout.
+Everything below was checked on 2026-08-10 against XCP-ng 8.3.0 / XAPI 26.1,
+reversing the `EFI-variables` blob of a standing UEFI template. All pool access
+was read-only: session login, getters, logout.
 
 ## 1. The kernel must be a bzImage, not the vmlinux the module hands you
 
@@ -90,6 +91,14 @@ The variable section does **not** begin at offset 32. In the sample blob it
 began at 292, and `292 + section_length == len(blob)` exactly. Compute the
 start as `len(blob) - section_length`; do not hardcode 292. The 260 bytes
 between the header and the first record were not identified.
+
+That is not a theoretical caution. The sample reversed here was the *template*
+`jenkins-golden-debian` (37564 bytes); the VM of the same name on the same host
+carries 37444. Two records that look interchangeable do not have the same
+length, so an offset that happens to work against one will silently mis-parse
+the other. Note also that `VM.get_all_records` returns templates alongside VMs,
+so a probe that matches on `name_label` alone can easily read the one it did
+not mean to — which is how the size difference came to light.
 
 Then `count` records, each:
 
