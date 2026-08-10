@@ -181,9 +181,23 @@ func newJSONRPCClient(ctx context.Context, c Config) (*jsonrpcClient, error) {
 		password: c.Password,
 		http: &http.Client{
 			Transport: &http.Transport{
-				DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ResponseHeaderTimeout: 60 * time.Second,
+				DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+				TLSHandshakeTimeout: 10 * time.Second,
+				// No ResponseHeaderTimeout, and this is not an oversight.
+				//
+				// XAPI's synchronous JSON-RPC sends no response headers until
+				// the call has finished, so "time to first header" is the
+				// duration of the whole operation, not of the network round
+				// trip. A VDI.clone on an LVM SR, a VM.start waiting on a slow
+				// boot, or a raw import of a large disk will all outrun any
+				// value picked here — and the failure is the nastiest kind:
+				// the client reports a transport error for an operation that
+				// is still running and will succeed on the pool. The caller
+				// then retries, and now there are two.
+				//
+				// The dial and TLS handshake timeouts above stay, because
+				// those really do bound network setup rather than server work.
+				// Per-call context deadlines are what bound the operation.
 				TLSClientConfig: &tls.Config{
 					// Go's default floor is already 1.2, so this changes
 					// nothing today. It is here as documentation, and so a
