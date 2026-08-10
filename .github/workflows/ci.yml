@@ -102,9 +102,25 @@ jobs:
         working-directory: machine
         run: |
           echo "=== disk before ==="; df -h /
-          go vet ./...
-          go test -v -timeout 3m ./... || {
+          echo "=== nproc / mem ==="; sysctl -n hw.ncpu hw.memsize || true
+
+          # go vet is the half that has never been instrumented, and the
+          # evidence now points at it: the previous run left go test bounded at
+          # 3m and the timeout never fired in 32 minutes, so the stall is
+          # upstream of the tests. -x prints each action as it runs, so the log
+          # shows the last package vet got to before it stopped. timeout(1)
+          # bounds it, because Go has no equivalent flag for vet and an
+          # unbounded hang costs ~50 minutes of runner and yields no log.
+          echo "=== vet ==="
+          time timeout 300 go vet -x ./... 2>&1 | tail -40
+          vet_status=${PIPESTATUS[0]}
+          echo "vet exit=$vet_status (124 = timed out)"
+          echo "=== disk after vet ==="; df -h /
+          if [ "$vet_status" -ne 0 ]; then exit "$vet_status"; fi
+
+          echo "=== test ==="
+          time go test -v -timeout 3m ./... || {
             status=$?
-            echo "=== disk after ==="; df -h /
+            echo "=== disk after test ==="; df -h /
             exit $status
           }
