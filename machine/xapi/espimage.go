@@ -72,6 +72,12 @@ const (
 	// write, so they stay zero.
 	fatEOC  = 0x0FFFFFFF
 	fatFree = 0x00000000
+
+	// maxImageBytes bounds the file contents so the uint32 sector arithmetic
+	// below cannot overflow. 3 GiB leaves generous headroom under the 4 GiB
+	// point where totalSectors*sectorSize wraps, and is far above anything a
+	// kernel and initrd will plausibly reach.
+	maxImageBytes = 3 << 30
 )
 
 // espFile is one file to place in the image. Name is an 8.3 name; Dir is the
@@ -93,6 +99,7 @@ func buildESPImage(files []espFile) ([]byte, error) {
 	if len(files) == 0 {
 		return nil, errors.New("xapi: boot image needs at least one file")
 	}
+	var total uint64
 	for _, f := range files {
 		if err := validate83(f.Name); err != nil {
 			return nil, fmt.Errorf("xapi: file %q: %w", f.Name, err)
@@ -102,6 +109,13 @@ func buildESPImage(files []espFile) ([]byte, error) {
 				return nil, fmt.Errorf("xapi: directory %q: %w", f.Dir, err)
 			}
 		}
+		if err := checkFileSize(f.Name, uint64(len(f.Data))); err != nil {
+			return nil, err
+		}
+		total += uint64(len(f.Data))
+	}
+	if err := checkTotalSize(total); err != nil {
+		return nil, err
 	}
 
 	fat, err := layoutFAT(files)
@@ -118,6 +132,38 @@ func buildESPImage(files []espFile) ([]byte, error) {
 	fat.writeInto(img[espFirstLBA*sectorSize:])
 	writeGPT(img, totalSectors, espFirstLBA, espFirstLBA+partSectors-1)
 	return img, nil
+}
+
+// checkFileSize rejects a single file FAT cannot describe.
+//
+// A directory entry records the length in a uint32, so at 4 GiB and above the
+// value truncates and the entry names a shorter file than the one written —
+// silently, and only visible to whoever reads the file back.
+func checkFileSize(name string, size uint64) error {
+	if size >= 1<<32 {
+		return fmt.Errorf("xapi: file %q is %d bytes; FAT32 cannot record a size of 4 GiB or more",
+			name, size)
+	}
+	return nil
+}
+
+// checkTotalSize bounds the whole image so the uint32 sector arithmetic cannot
+// overflow.
+//
+// Every offset in this file is a uint32 of sectors, and `totalSectors *
+// sectorSize` is evaluated in uint32. Past 4 GiB it wraps, make() is handed a
+// short buffer, and an input that is merely too large becomes an out-of-range
+// write instead of an error. Bounding the input at the entry point makes every
+// later offset in range by construction rather than by inspection.
+//
+// Split out from buildESPImage so it can be tested: proving the bound by
+// actually allocating four gigabytes is not a test worth having.
+func checkTotalSize(total uint64) error {
+	if total > maxImageBytes {
+		return fmt.Errorf("xapi: boot image contents total %d bytes, over the %d-byte limit",
+			total, uint64(maxImageBytes))
+	}
+	return nil
 }
 
 // fatLayout is the computed geometry of the FAT32 volume plus the placement
@@ -598,10 +644,9 @@ func writeProtectiveMBR(img []byte, totalSectors uint32) {
 	p[4] = 0xEE
 	p[5], p[6], p[7] = 0xFF, 0xFF, 0xFF
 	binary.LittleEndian.PutUint32(p[8:], 1)
-	size := totalSectors - 1
-	if totalSectors-1 > 0xFFFFFFFF {
-		size = 0xFFFFFFFF
-	}
-	binary.LittleEndian.PutUint32(p[12:], size)
+	// totalSectors is a uint32, so the sector count after LBA 0 always fits
+	// the 32-bit field. The 0xFFFFFFFF cap a protective MBR normally carries
+	// exists for disks addressed in 64 bits, and cannot apply here.
+	binary.LittleEndian.PutUint32(p[12:], totalSectors-1)
 	img[510], img[511] = 0x55, 0xAA
 }

@@ -45,7 +45,10 @@ in the trust path.
 
 `espimage.go` builds the disk: protective MBR, GPT, one FAT32 EFI System
 Partition. The firmware loads the kernel from the removable-media fallback
-path, so the bzImage goes to `\EFI\BOOT\BOOTX64.EFI` with the initrd beside it.
+path, so the bzImage goes to `\EFI\BOOT\BOOTX64.EFI` and the initrd goes to
+`\INITRD.IMG` in the volume root — not alongside the kernel. The two paths
+differ, and the `initrd=` the boot option carries has to name the second one,
+so it is worth stating rather than implying.
 
 The FAT writer is deliberately partial — write-once, contiguous cluster runs,
 8.3 names only. See the comment at the top of `espimage.go` for why that

@@ -261,6 +261,31 @@ func TestRejectsMalformedDirs(t *testing.T) {
 	}
 }
 
+// TestRejectsOversizedInput covers the bound that keeps every uint32 sector
+// offset in range. Without it, totalSectors*sectorSize wraps, make() gets a
+// short buffer, and a too-large input becomes an out-of-range write instead of
+// an error.
+//
+// The oversized case allocates nothing: the check runs on len(Data) before any
+// image is built, so a nil-backed slice of the right length is enough to prove
+// it and the test stays cheap.
+func TestRejectsOversizedInput(t *testing.T) {
+	// The bounds are checked as sizes rather than by building a four-gigabyte
+	// input, which is why they live in their own functions. buildESPImage
+	// calls exactly these, so the real path is the tested path.
+	require.NoError(t, checkFileSize("OK.IMG", 1<<20))
+	require.Error(t, checkFileSize("HUGE.IMG", 1<<32),
+		"FAT records size in a uint32; 4 GiB truncates to zero")
+	require.ErrorContains(t, checkFileSize("HUGE.IMG", 1<<32), "4 GiB")
+
+	require.NoError(t, checkTotalSize(maxImageBytes))
+	require.ErrorContains(t, checkTotalSize(maxImageBytes+1), "limit")
+
+	// And the ordinary path still builds.
+	_, err := buildESPImage([]espFile{{Name: "BOOTX64.EFI", Data: []byte("x")}})
+	require.NoError(t, err)
+}
+
 func TestReproducible(t *testing.T) {
 	// The boot VDI is cached per (kernel, cmdline). If two builds of the
 	// same inputs differ, every build looks like a new image to the cache.
