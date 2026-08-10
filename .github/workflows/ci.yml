@@ -81,8 +81,24 @@ jobs:
           go vet ./...
           go test ./...
 
+      # -p 1 runs one package's tests at a time. Without it this step does not
+      # fail — the runner is lost. The job dies at a consistent 52-53 minutes
+      # with the step still marked in progress, no conclusion, and no uploaded
+      # log; step-level timeout-minutes never fires and neither does Go's own
+      # -timeout, which is what a dead agent looks like rather than a deadlock.
+      #
+      # A macos-14 runner has 3 cores, ~7 GB of RAM and had 38 GiB free here,
+      # while compactext4 builds 16, 32 and 64 GiB images. Serialised they are
+      # sparse and take 3s; run concurrently with other packages the runner
+      # stops coming back. Bisected by splitting vet from test: vet completes
+      # in 4s, so the whole cost is in the concurrent test phase.
+      #
+      # The bound is cheap — 13s serialised against 10s parallel — so this is
+      # not a workaround with a running cost. -timeout 10m is hygiene: any
+      # future stall inside a single test now fails loudly with a goroutine
+      # dump instead of taking the runner down with it.
       - name: machine module — vet / test
         working-directory: machine
         run: |
           go vet ./...
-          go test ./...
+          go test -p 1 -timeout 10m ./...

@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -156,6 +157,53 @@ func dialFake(t *testing.T, f *fakeRPC) *jsonrpcClient {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cl.Close() })
 	return cl
+}
+
+// TestNoResponseHeaderTimeout guards a fix that is invisible from the outside
+// until it costs a real operation.
+//
+// XAPI's synchronous JSON-RPC withholds response headers until the call has
+// finished, so any ResponseHeaderTimeout is really a ceiling on how long a
+// pool operation may take. When it fires, the client reports a transport
+// error for a clone, import or start that is still running and will succeed —
+// and a caller that retries has now started a second one.
+//
+// This asserts the field rather than the behaviour on purpose: a behavioural
+// test could only prove the absence of a timeout shorter than the test's own
+// runtime, so it would pass just as happily against the 60s value this
+// replaced. The slow-response test below covers the behaviour that can be
+// observed cheaply.
+func TestNoResponseHeaderTimeout(t *testing.T) {
+	f := newFakeRPC(t, loginOnly)
+	cl := dialFake(t, f)
+
+	tr, ok := cl.http.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.Zero(t, tr.ResponseHeaderTimeout,
+		"a ResponseHeaderTimeout bounds how long a pool operation may take, "+
+			"not how long the network may take; per-call contexts bound the operation")
+
+	// The timeouts that really do bound network setup should stay.
+	require.NotZero(t, tr.TLSHandshakeTimeout)
+}
+
+// TestSlowResponseStillSucceeds is the behavioural half: a pool that thinks
+// before answering must not be mistaken for a broken one.
+func TestSlowResponseStillSucceeds(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"OpaqueRef:s"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cl, err := newJSONRPCClient(ctx, Config{
+		URL: srv.URL, Username: "root", Password: "hunter2", InsecureTLS: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cl.Close() })
 }
 
 func TestJSONRPCLoginSendsExpectedParams(t *testing.T) {
