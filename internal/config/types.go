@@ -361,9 +361,19 @@ var DefaultAllowedDomains = []string{
 	"*.snapcraftcontent.com", // the CDN snap redirects to for actual .snap downloads
 }
 
-// PortForward maps a host port to a guest port so services running in the VM
-// are reachable from the host (e.g., dev servers). Applied at VM start time;
-// changes require an `up` cycle to take effect.
+// PortForward maps a host port to a guest port. It expresses both forwarding
+// directions; which one applies depends on the field it is stored in.
+//
+//   - Sandbox.Forwards (outbound): host 127.0.0.1:HostPort → guest GuestPort,
+//     served by gvproxy. Applied at VM start time; changes require an `up`
+//     cycle to take effect.
+//   - Sandbox.ReverseForwards (inbound): guest 127.0.0.1:GuestPort → host
+//     127.0.0.1:HostPort, tunnelled over vsock (see internal/revfwd).
+//     Applied live to a running sandbox.
+//
+// The HostPort:GuestPort spelling is deliberately the same in both — a spec
+// always reads "this host port, that guest port", so `3000:80` maps the same
+// pair of ports whichever direction is being configured.
 type PortForward struct {
 	HostPort  int `json:"host_port"`
 	GuestPort int `json:"guest_port"`
@@ -435,6 +445,12 @@ type Sandbox struct {
 	Phases       []Phase       `json:"phases"`
 	Network      NetworkPolicy `json:"network"`
 	Forwards     []PortForward `json:"forwards,omitempty"`
+	// ReverseForwards are host loopback services exposed on the guest's
+	// own loopback — the inbound counterpart of Forwards. Unlike Forwards
+	// (a gvproxy binding fixed at VM start) these are tunnelled over vsock
+	// by the daemon, so edits apply to a running sandbox. See
+	// internal/revfwd.
+	ReverseForwards []PortForward `json:"reverse_forwards,omitempty"`
 	// Files is the list of host->guest file copies refreshed on every
 	// `clawk up`. See HostFile. Empty = no snapshots.
 	Files []HostFile `json:"files,omitempty"`
@@ -508,6 +524,16 @@ type Sandbox struct {
 	// the amount allocated at boot. Zero = provider default.
 	MemoryMaxMiB uint64 `json:"memory_max_mib,omitempty"`
 
+	// DiskMiB is the sparse ext4 root-disk ceiling in mebibytes, from
+	// clawk.mod `vm ( disk <size> )`. Zero = sandbox.DefaultDiskSizeGiB.
+	// The disk is sparse, so this bounds how far the guest may grow without
+	// reserving the full size up front — but the build does write an inode
+	// table proportional to the ceiling (~1/64 of it; see
+	// sandbox.DefaultDiskSizeGiB), so a bigger ceiling is cheap, not free.
+	// It's baked into the rootfs at build time, so a change takes effect on
+	// the next rootfs (re)build.
+	DiskMiB uint64 `json:"disk_mib,omitempty"`
+
 	// IdleTimeoutSec is how long the sandbox may sit idle (no attached
 	// session, quiescent guest) before its VM daemon stops it to reclaim
 	// host memory. Zero = the built-in default; negative = never stop.
@@ -515,6 +541,29 @@ type Sandbox struct {
 	// is a park, not a `clawk down`: DesiredState stays running and any
 	// attach boots the VM back.
 	IdleTimeoutSec int64 `json:"idle_timeout_sec,omitempty"`
+
+	// Setup holds the workspace-level `on up` commands, sourced from a
+	// workspace clawk.mod (a sandbox block with `includes`). Unlike
+	// Phase.Setup — which runs per phase in that phase's worktree — these run
+	// once per boot at the guest workspace root (the parent of every phase
+	// worktree): the CWD-independent, VM-wide slot for a swapfile, a shared
+	// daemon, or a sysctl tweak. Empty for single-repo sandboxes, whose
+	// `on up` is per-phase. Snapshotted at create like every other clawk.mod
+	// value.
+	Setup []string `json:"setup,omitempty"`
+
+	// OnCreate holds the workspace-level `on create` commands from a workspace
+	// clawk.mod — the VM-wide, once-ever counterpart to Phase.OnCreate, run at
+	// the guest workspace root before the runner first attaches (a global
+	// toolchain install, a shared clone). It participates in the same
+	// create-pending/retry flow as the per-phase hooks: a failure marks the
+	// sandbox create-pending and is retried on the next `clawk up`. Empty for
+	// single-repo sandboxes, whose `on create` is per-phase.
+	OnCreate []string `json:"on_create,omitempty"`
+	// OnCreateAt records when the workspace-level OnCreate last completed
+	// successfully. Zero means it has not run yet (or the sandbox is
+	// create-pending). Mirrors Phase.OnCreateAt.
+	OnCreateAt time.Time `json:"on_create_at,omitempty"`
 
 	// --- Status: observed runtime state, NOT user-authoritative ---------------
 	// A reconciled cache; the provider/OS is the source of truth. Reconcile via

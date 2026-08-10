@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/netip"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/clawkwork/clawk/internal/envspec"
@@ -96,7 +98,11 @@ type Template struct {
 	// block.
 	DenySources []string
 	Forwards    []string // port forward specs (PORT or HOST:GUEST)
-	Env         []string // env entries to export in the VM (canonical envspec form; see parseEnvBlock)
+	// ReverseForwards are the `reverse <spec>` entries of a forwards
+	// block: host loopback ports exposed on the guest's loopback. Same
+	// HOST:GUEST spelling as Forwards, opposite direction of travel.
+	ReverseForwards []string
+	Env             []string // env entries to export in the VM (canonical envspec form; see parseEnvBlock)
 
 	// Lifecycle hooks. Each is a list of shell commands run inside the
 	// VM at the named moment.
@@ -150,6 +156,15 @@ type Template struct {
 	// the guest sees at boot. Zero = provider default.
 	MemoryMaxMiB uint64
 
+	// DiskMiB overrides the sparse ext4 root-disk ceiling, in mebibytes
+	// (vm ( disk <size> )). Zero = the built-in sandbox.DefaultDiskSizeGiB.
+	// The disk is sparse, so a larger ceiling mostly costs nothing until the
+	// guest writes into it — the exception is the inode table, ~1/64 of the
+	// ceiling, written at build time (see sandbox.DefaultDiskSizeGiB). Raise
+	// it for repos with big dependency trees now that toolchain caches live
+	// on the rootfs.
+	DiskMiB uint64
+
 	// IdleTimeoutSec is the sandbox's idle-stop timeout in seconds: how
 	// long the VM may sit with no attached session and a quiescent guest
 	// before the daemon stops it to reclaim host memory. Declared as
@@ -200,6 +215,7 @@ func (t *Template) Merge(over *Template) {
 	t.DenyIPs = append(t.DenyIPs, over.DenyIPs...)
 	t.Use = append(t.Use, over.Use...)
 	t.Forwards = append(t.Forwards, over.Forwards...)
+	t.ReverseForwards = append(t.ReverseForwards, over.ReverseForwards...)
 	t.Env = append(t.Env, over.Env...)
 	t.OnCreate = append(t.OnCreate, over.OnCreate...)
 	t.OnUp = append(t.OnUp, over.OnUp...)
@@ -225,6 +241,9 @@ func (t *Template) Merge(over *Template) {
 	}
 	if over.MemoryMaxMiB != 0 {
 		t.MemoryMaxMiB = over.MemoryMaxMiB
+	}
+	if over.DiskMiB != 0 {
+		t.DiskMiB = over.DiskMiB
 	}
 	if over.IdleTimeoutSec != 0 {
 		t.IdleTimeoutSec = over.IdleTimeoutSec
@@ -285,7 +304,7 @@ func (p *parser) parseTemplateDirective(tmpl *Template, t Token) error {
 	case "on":
 		return p.parseOnDirective(tmpl)
 	case "forwards":
-		return p.parseIdentBlock(&tmpl.Forwards, "forwards")
+		return p.parseForwardsBlock(tmpl)
 	case "files":
 		return p.parseFilesBlock(tmpl)
 	case "shares":
@@ -381,6 +400,78 @@ func (p *parser) parseValidatedIdentBlock(dst *[]string, directive string, valid
 		*dst = append(*dst, t.Val)
 		p.advance()
 	}
+}
+
+// parseForwardsBlock parses a `forwards ( … )` block (or the inline
+// `forwards ENTRY` form). An entry is a port spec — `PORT` or
+// `HOST:GUEST` — optionally prefixed with `reverse`:
+//
+//	forwards (
+//	    3000            # guest 3000 reachable at localhost:3000 on the host
+//	    8080:80         # guest 80   reachable at localhost:8080 on the host
+//	    reverse 63342   # the host's localhost:63342 reachable inside the guest
+//	)
+//
+// `reverse` is a modifier rather than its own top-level directive because
+// the two lists are the same thing pointed in opposite directions —
+// keeping them in one block is what makes the asymmetry visible.
+//
+// Specs are validated downstream (internal/cli parses them into
+// config.PortForward), same as before: this only sorts entries into the
+// two lists.
+func (p *parser) parseForwardsBlock(tmpl *Template) error {
+	p.advance() // consume "forwards"
+	t := p.peek()
+
+	// Inline form: `forwards ENTRY` / `forwards reverse ENTRY`
+	if t.Kind == TokIdent {
+		if err := p.parseForwardEntry(tmpl); err != nil {
+			return err
+		}
+		return p.expectNewlineOrEOF()
+	}
+
+	if t.Kind != TokLParen {
+		return p.errorAt(t, "expected '(' or identifier after %q, got %s", "forwards", t)
+	}
+	p.advance()
+	for {
+		p.skipNewlines()
+		if t := p.peek(); t.Kind == TokRParen {
+			p.advance()
+			return p.expectNewlineOrEOF()
+		} else if t.Kind != TokIdent {
+			return p.errorAt(t, "expected entry or ')' in %q, got %s", "forwards", t)
+		}
+		if err := p.parseForwardEntry(tmpl); err != nil {
+			return err
+		}
+	}
+}
+
+// parseForwardEntry consumes one forwards entry, with the current token
+// already known to be a TokIdent.
+func (p *parser) parseForwardEntry(tmpl *Template) error {
+	t := p.peek()
+	if t.Val != "reverse" {
+		if isKeyword(t.Val) {
+			return p.errorAt(t, "unexpected keyword %q in %q", t.Val, "forwards")
+		}
+		tmpl.Forwards = append(tmpl.Forwards, t.Val)
+		p.advance()
+		return nil
+	}
+	p.advance() // consume "reverse"
+	// The spec must follow on the same line; a newline token here means
+	// the user wrote a bare `reverse`, which we reject rather than
+	// silently swallowing the next entry.
+	spec := p.peek()
+	if spec.Kind != TokIdent || isKeyword(spec.Val) {
+		return p.errorAt(spec, "expected a port spec after 'reverse', got %s", spec)
+	}
+	tmpl.ReverseForwards = append(tmpl.ReverseForwards, spec.Val)
+	p.advance()
+	return nil
 }
 
 // parseEnvBlock parses an `env ( … )` block (or the inline `env ENTRY`
@@ -511,9 +602,10 @@ func (p *parser) parseCPU(tmpl *Template) error {
 	return p.expectNewlineOrEOF()
 }
 
-// parseMemory handles `memory <size>` and `memory_max <size>` — a single
-// size value in MiB, GiB, TiB (or SI MB/GB/TB). Bare numbers without a
-// unit suffix are rejected to force unit-explicit configs.
+// parseMemory is the shared size-directive parser for the vm block —
+// `memory`, `memory_max`, and `disk`. It reads a single size value in
+// MiB, GiB, TiB (or SI MB/GB/TB) into dst. Bare numbers without a unit
+// suffix are rejected to force unit-explicit configs.
 func (p *parser) parseMemory(dst *uint64, directive string) error {
 	p.advance() // consume directive name
 	val := p.peek()
@@ -618,9 +710,9 @@ func (p *parser) parseNested(tmpl *Template) error {
 }
 
 // parseVMBlock handles the `vm ( ... )` block — the scalar VM settings:
-// provider, cpu, memory, memory_max, nested, image, kernel. Each reuses a
-// dedicated per-directive parser so size-unit handling and duplicate
-// detection have a single source of truth.
+// provider, cpu, memory, memory_max, disk, nested, image, kernel. Each
+// reuses a dedicated per-directive parser so size-unit handling and
+// duplicate detection have a single source of truth.
 func (p *parser) parseVMBlock(tmpl *Template) error {
 	p.advance() // consume "vm"
 	t := p.peek()
@@ -655,6 +747,10 @@ func (p *parser) parseVMBlock(tmpl *Template) error {
 			if err := p.parseMemory(&tmpl.MemoryMaxMiB, "memory_max"); err != nil {
 				return err
 			}
+		case "disk":
+			if err := p.parseMemory(&tmpl.DiskMiB, "disk"); err != nil {
+				return err
+			}
 		case "nested":
 			if err := p.parseNested(tmpl); err != nil {
 				return err
@@ -675,7 +771,7 @@ func (p *parser) parseVMBlock(tmpl *Template) error {
 			return p.errorAt(t,
 				"unknown 'vm' directive %q (want %s)", t.Val,
 				describeFirst([]string{
-					"provider", "cpu", "memory", "memory_max", "nested", "idle_timeout", "image", "kernel",
+					"provider", "cpu", "memory", "memory_max", "disk", "nested", "idle_timeout", "image", "kernel",
 				}))
 		}
 	}
@@ -827,6 +923,19 @@ func (p *parser) parseNetworkEntry(tmpl *Template, deny bool) error {
 	if isKeyword(t.Val) {
 		return p.errorAt(t, "unexpected keyword %q in network entry", t.Val)
 	}
+	// A bare entry that is actually an IP or CIDR is a silent footgun: it
+	// parses fine but lands in the domain list, which is only matched at
+	// DNS-resolution time — so a raw connect to that address is denied with
+	// no hint why. Steer to the explicit `ip` form. (The CLI's
+	// classifyAllowEntry enforces the same rule for `clawk network allow`.)
+	if looksLikeAddress(t.Val) {
+		directive := "allow"
+		if deny {
+			directive = "deny"
+		}
+		return p.errorAt(t, "%q is an IP or CIDR, not a domain — write %q instead (bare %q entries are domains, matched only at DNS resolution)",
+			t.Val, directive+" ip "+t.Val, directive)
+	}
 	if deny {
 		tmpl.DenyDomains = append(tmpl.DenyDomains, t.Val)
 	} else {
@@ -834,6 +943,18 @@ func (p *parser) parseNetworkEntry(tmpl *Template, deny bool) error {
 	}
 	p.advance()
 	return nil
+}
+
+// looksLikeAddress reports whether a bare network-entry token is really an
+// IP address or CIDR range rather than a domain. Any '/' marks a CIDR (a
+// domain never contains one, valid or not); otherwise a token that parses
+// as an IP address is one.
+func looksLikeAddress(s string) bool {
+	if strings.Contains(s, "/") {
+		return true
+	}
+	_, err := netip.ParseAddr(s)
+	return err == nil
 }
 
 // parseSkillsBlock handles `skills ( <path> [<version>] ... )`. Each entry

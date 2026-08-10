@@ -97,6 +97,59 @@ func TestLoadWorkspaceSingleRepo(t *testing.T) {
 	}
 }
 
+// TestLoadWorkspaceAllowsWorkspaceHooks: a workspace root may declare `on up`
+// and `on create`; both land on ws.File as VM-wide hooks that run once at the
+// workspace root, distinct from the per-repo hooks each Clawkfile carries.
+func TestLoadWorkspaceAllowsWorkspaceHooks(t *testing.T) {
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "svc")
+	require.NoError(t, os.MkdirAll(repo, 0o755))
+	initRepo(t, repo)
+
+	wsPath := filepath.Join(dir, RepoFileName)
+	require.NoError(t, os.WriteFile(wsPath, []byte(`sandbox (
+    includes (
+        ./svc
+    )
+    on up (
+        "scripts/ensure-swap.sh"
+    )
+    on create (
+        "sudo apt-get install -y ripgrep"
+    )
+)
+`), 0o644))
+
+	ws, err := LoadWorkspace(wsPath)
+	require.NoError(t, err)
+	require.Equal(t, []string{"scripts/ensure-swap.sh"}, ws.File.OnUp)
+	require.Equal(t, []string{"sudo apt-get install -y ripgrep"}, ws.File.OnCreate)
+}
+
+// TestLoadWorkspaceRejectsReservedHooks: `on down` / `on enter` are reserved
+// and wired nowhere, so a workspace root that declares them is rejected with
+// the per-repo hint rather than silently swallowing config that never runs.
+func TestLoadWorkspaceRejectsReservedHooks(t *testing.T) {
+	for _, event := range []string{"down", "enter"} {
+		t.Run(event, func(t *testing.T) {
+			dir := t.TempDir()
+			repo := filepath.Join(dir, "svc")
+			require.NoError(t, os.MkdirAll(repo, 0o755))
+			initRepo(t, repo)
+
+			wsPath := filepath.Join(dir, RepoFileName)
+			require.NoError(t, os.WriteFile(wsPath, []byte(
+				"sandbox (\n    includes (\n        ./svc\n    )\n    on "+
+					event+" (\n        \"echo hi\"\n    )\n)\n"), 0o644))
+
+			_, err := LoadWorkspace(wsPath)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "on "+event)
+			require.Contains(t, err.Error(), "per-repo")
+		})
+	}
+}
+
 func TestLoadWorkspaceNameOverride(t *testing.T) {
 	dir := t.TempDir()
 	repo := filepath.Join(dir, "odd-dir-name")

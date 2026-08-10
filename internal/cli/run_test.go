@@ -197,6 +197,55 @@ func TestRunWorkspaceRepos(t *testing.T) {
 	}
 }
 
+// TestRunWorkspaceLevelHooks: a workspace root's own `on up` / `on create`
+// land on the sandbox (Sandbox.Setup / Sandbox.OnCreate — run once at the
+// workspace root), separate from the per-repo hooks that ride each phase.
+func TestRunWorkspaceLevelHooks(t *testing.T) {
+	_, _ = setupTest(t)
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "svc")
+	require.NoError(t, os.MkdirAll(repo, 0o755))
+	gitInit(t, repo)
+
+	// A per-repo hook to prove the two scopes stay distinct.
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "clawk.mod"),
+		[]byte("sandbox (\n    on up (\n        \"make deps\"\n    )\n)\n"), 0o644))
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "clawk.mod"),
+		[]byte(`sandbox (
+    vm (
+        provider vz
+    )
+    includes (
+        ./svc
+    )
+    on up (
+        "scripts/ensure-swap.sh"
+    )
+    on create (
+        "install-global-toolchain"
+    )
+)
+`), 0o644))
+
+	_, err := executeCommand(
+		"work", filepath.Join(dir, "clawk.mod"), "WS-1", "--bare",
+	)
+	require.NoError(t, err)
+
+	sb, err := store.Load("WS-1")
+	require.NoError(t, err, "sandbox not created")
+	require.Equal(t, []string{"scripts/ensure-swap.sh"}, sb.Setup,
+		"workspace-level on up should land on Sandbox.Setup")
+	require.Equal(t, []string{"install-global-toolchain"}, sb.OnCreate,
+		"workspace-level on create should land on Sandbox.OnCreate")
+
+	require.Len(t, sb.Phases, 1)
+	require.Equal(t, []string{"make deps"}, sb.Phases[0].Setup,
+		"per-repo on up must stay on the phase, not the sandbox")
+}
+
 func TestRunOnlyFiltersRepos(t *testing.T) {
 	_, _ = setupTest(t)
 
@@ -300,6 +349,56 @@ func TestRunPortConflict(t *testing.T) {
 	)
 	require.Error(t, err)
 	require.True(t, strings.Contains(err.Error(), "host port 3000"))
+}
+
+// TestRunReverseForwards: `reverse` entries from the workspace and a repo
+// union onto the record's ReverseForwards, and never into Forwards.
+func TestRunReverseForwards(t *testing.T) {
+	_, _ = setupTest(t)
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "app")
+	require.NoError(t, os.MkdirAll(repo, 0o755))
+	gitInit(t, repo)
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "clawk.mod"),
+		[]byte("sandbox (\n  forwards (\n    3000\n    reverse 5432:15432\n  )\n)\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "clawk.mod"),
+		[]byte("sandbox (\n  includes (\n    ./app\n  )\n  forwards (\n    reverse 63342\n  )\n)\n"), 0o644))
+
+	_, err := executeCommand("work", filepath.Join(dir, "clawk.mod"), "REV-1", "--bare")
+	require.NoError(t, err)
+
+	sb, err := store.Load("REV-1")
+	require.NoError(t, err)
+	require.Equal(t, []config.PortForward{{HostPort: 3000, GuestPort: 3000}}, sb.Forwards)
+	require.ElementsMatch(t, []config.PortForward{
+		{HostPort: 63342, GuestPort: 63342},
+		{HostPort: 5432, GuestPort: 15432},
+	}, sb.ReverseForwards)
+}
+
+// A reverse forward binds inside the guest, so the conflict that matters
+// is two sources claiming the same GUEST port — even with different host
+// ports, which would pass the outbound direction's check.
+func TestRunReverseForwardGuestPortConflict(t *testing.T) {
+	_, _ = setupTest(t)
+
+	dir := t.TempDir()
+	for _, sub := range []string{"a", "b"} {
+		r := filepath.Join(dir, sub)
+		require.NoError(t, os.MkdirAll(r, 0o755))
+		gitInit(t, r)
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "a", "clawk.mod"),
+		[]byte("sandbox (\n  forwards (\n    reverse 5432:15432\n  )\n)\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "b", "clawk.mod"),
+		[]byte("sandbox (\n  forwards (\n    reverse 6432:15432\n  )\n)\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "clawk.mod"),
+		[]byte("sandbox (\n  includes (\n    ./a\n    ./b\n  )\n)\n"), 0o644))
+
+	_, err := executeCommand("work", filepath.Join(dir, "clawk.mod"), "REV-2", "--bare")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "guest port 15432")
 }
 
 // TestRunProviderConflict: two repos disagree on provider and the workspace

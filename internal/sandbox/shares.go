@@ -241,14 +241,33 @@ func SeedClaudeMemory(stateRoot, seed string) error {
 // NinepBasePort is the first guest vsock port used by the host 9p cache
 // servers; each ToolchainCacheShares entry gets NinepBasePort+index. Chosen
 // clear of the fixed control ports (1024 pty-agent, 1025 time-sync, 1026
-// ssh-agent) with headroom so adding a cache never collides.
+// ssh-agent, 1027 mem-report, 1028 reverse-forward) with headroom so adding
+// a cache never collides.
 const NinepBasePort uint32 = 1100
 
+// ToolchainCachesEnabled gates ToolchainCacheShares. It is false: every
+// entry is served over 9p-over-vsock (each carries a NinePVSockPort), and
+// that transport caused frequent, hard-to-diagnose breakage — the Go module
+// cache and Cargo registry rely on file locking and read-only/atomic-rename
+// semantics 9p-over-vsock does not honour reliably, surfacing as "checksum
+// mismatch" module failures, EACCES and stalled locks, and half-written cache
+// entries. Re-downloading a module set per VM is cheaper than that breakage
+// (and is why sandbox.DefaultDiskSizeGiB is 32 — the caches land on the
+// rootfs instead).
+//
+// Flip this to true to restore cache sharing once the 9p transport is
+// hardened; the specs below stay compiled and tested so nothing rots in the
+// meantime, and the tests that assert them gate on this same constant.
+const ToolchainCachesEnabled = false
+
 // ToolchainCacheShares returns host shares that back the dependency
-// caches of common language toolchains. Mounting one host directory per
-// cache means a module/crate is downloaded once and reused across every
-// sandbox — preventing the multi-GB-per-sandbox blowup we observed
-// where each new clone re-downloaded the same Go module set.
+// caches of common language toolchains. Returns nothing while
+// ToolchainCachesEnabled is false — see there for why.
+//
+// When enabled: mounting one host directory per cache means a module/crate
+// is downloaded once and reused across every sandbox — preventing the
+// multi-GB-per-sandbox blowup we observed where each new clone
+// re-downloaded the same Go module set.
 //
 // Each guest path is the toolchain's *default* cache location, so no
 // env vars and no provision.sh changes are required: the mount is
@@ -294,7 +313,7 @@ const NinepBasePort uint32 = 1100
 //
 // Pass cacheDir = "" to opt out.
 func ToolchainCacheShares(cacheDir string) []HostShare {
-	if cacheDir == "" {
+	if cacheDir == "" || !ToolchainCachesEnabled {
 		return nil
 	}
 	specs := []struct{ sub, tag, guest string }{

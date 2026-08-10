@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/clawkwork/clawk/internal/config"
+	"github.com/clawkwork/clawk/internal/sandbox"
 	"github.com/stretchr/testify/require"
 )
 
@@ -133,6 +134,43 @@ func TestHereSandboxPicksUpIdleTimeout(t *testing.T) {
 	require.True(t, created)
 	require.EqualValues(t, 120, sb.IdleTimeoutSec,
 		"idle_timeout from clawk.mod must be snapshotted at create")
+}
+
+// TestHereSandboxPicksUpDisk: same rule as idle_timeout above — `disk` is a
+// vm ( ... ) scalar, so the cwd-mode create path must snapshot it too. It was
+// initially wired only into the workspace path, which silently pinned every
+// cwd sandbox to the default ceiling.
+func TestHereSandboxPicksUpDisk(t *testing.T) {
+	withTempStore(t)
+
+	dir := t.TempDir()
+	gitInit(t, dir) // the standalone clawk.mod loader requires a git repo
+	mod := "sandbox (\n    vm (\n        disk 64GiB\n    )\n)\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "clawk.mod"), []byte(mod), 0o644))
+
+	sb, created, err := loadOrCreateHereSandbox("disk-here", dir)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.EqualValues(t, 64*1024, sb.DiskMiB,
+		"disk from clawk.mod must be snapshotted at create")
+	require.Equal(t, 64*1024, sandbox.RootDiskSizeMiB(sb),
+		"the snapshotted ceiling must reach the rootfs builder")
+}
+
+// TestHereSandboxRejectsTinyDisk: the sub-1-GiB floor is enforced on the
+// cwd path too, so a `disk 32M` unit typo fails the create instead of
+// building an unusable rootfs.
+func TestHereSandboxRejectsTinyDisk(t *testing.T) {
+	withTempStore(t)
+
+	dir := t.TempDir()
+	gitInit(t, dir)
+	mod := "sandbox (\n    vm (\n        disk 32M\n    )\n)\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "clawk.mod"), []byte(mod), 0o644))
+
+	_, _, err := loadOrCreateHereSandbox("tiny-here", dir)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "disk must be >= 1 GiB")
 }
 
 // TestHereSandboxRegistersFilePolicies: the cwd-mode create path registers

@@ -464,12 +464,21 @@ func effectiveUseForLog(sb *config.Sandbox) []string {
 	return effectiveUse(ns, sb)
 }
 
+// reverseForwardSink publishes a reverse-forward set to the in-guest agent.
+// An interface so controlHandlers stays platform-neutral: the only
+// implementation is the darwin reverseProxy, and the firecracker daemon
+// passes nil (its backend can't accept guest-initiated vsock connections).
+type reverseForwardSink interface {
+	Set([]config.PortForward)
+}
+
 // controlHandlers builds the control-socket callbacks shared by both VM
 // daemons: the denial ledger, a live network-policy reload from the store,
-// the VM lifecycle surface (pause/resume/suspend), and (when the allow
-// list has one) the interactive gate.
-func controlHandlers(sb *config.Sandbox, allow *netfilter.AllowList, lc *vmLifecycle, logger *log.Logger) vzdctl.Handlers {
-	return vzdctl.Handlers{
+// the VM lifecycle surface (pause/resume/suspend), reverse-forward reloads
+// when the daemon has a sink for them, and (when the allow list has one)
+// the interactive gate.
+func controlHandlers(sb *config.Sandbox, allow *netfilter.AllowList, lc *vmLifecycle, rev reverseForwardSink, logger *log.Logger) vzdctl.Handlers {
+	h := vzdctl.Handlers{
 		Denials:   allow.Denials,
 		Lifecycle: lc.lifecycleHandlers(),
 		Reload: func() error {
@@ -488,6 +497,18 @@ func controlHandlers(sb *config.Sandbox, allow *netfilter.AllowList, lc *vmLifec
 		},
 		Gate: allow.Gate(),
 	}
+	if rev != nil {
+		h.ReloadForwards = func() error {
+			cur, err := store.Load(sb.Name)
+			if err != nil {
+				return fmt.Errorf("reloading sandbox record: %w", err)
+			}
+			rev.Set(cur.ReverseForwards)
+			logger.Printf("reverse forwards reloaded: %d", len(cur.ReverseForwards))
+			return nil
+		}
+	}
+	return h
 }
 
 // persistAlwaysAllow records an interactive "allow always" decision in the
