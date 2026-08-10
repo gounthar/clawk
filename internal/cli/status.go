@@ -65,9 +65,10 @@ type statusJSONOutput struct {
 	Branches   []statusJSONBranch `json:"branches"`
 
 	// v2 additive blocks.
-	Forwards []statusJSONForward `json:"forwards,omitempty"`
-	Network  *statusJSONNetwork  `json:"network,omitempty"`
-	Setup    []statusJSONSetup   `json:"setup,omitempty"`
+	Forwards        []statusJSONForward `json:"forwards,omitempty"`
+	ReverseForwards []statusJSONForward `json:"reverse_forwards,omitempty"`
+	Network         *statusJSONNetwork  `json:"network,omitempty"`
+	Setup           []statusJSONSetup   `json:"setup,omitempty"`
 }
 
 type statusJSONBranch struct {
@@ -91,7 +92,13 @@ type statusJSONNetwork struct {
 }
 
 type statusJSONSetup struct {
-	Repo  string `json:"repo"`
+	// Scope is "workspace" for the sandbox-wide hooks (which run at the guest
+	// workspace root) or "repo" for a phase's own. It exists because Repo
+	// alone can't carry the distinction: a repo directory named "workspace"
+	// would be indistinguishable from the workspace entry. Repo is empty for
+	// the workspace scope.
+	Scope string `json:"scope"`
+	Repo  string `json:"repo,omitempty"`
 	Steps int    `json:"steps"`
 }
 
@@ -179,15 +186,27 @@ func renderStatusJSON(w io.Writer, sb *config.Sandbox, liveStatus string) error 
 			HostPort: f.HostPort, GuestPort: f.GuestPort,
 		})
 	}
+	for _, f := range sb.ReverseForwards {
+		out.ReverseForwards = append(out.ReverseForwards, statusJSONForward{
+			HostPort: f.HostPort, GuestPort: f.GuestPort,
+		})
+	}
 	out.Network = &statusJSONNetwork{
 		Use:    effectiveUseForLog(sb),
 		Blocks: sb.Network.Blocks,
+	}
+	if len(sb.Setup) > 0 {
+		out.Setup = append(out.Setup, statusJSONSetup{
+			Scope: "workspace",
+			Steps: len(sb.Setup),
+		})
 	}
 	for _, p := range sb.Phases {
 		if len(p.Setup) == 0 {
 			continue
 		}
 		out.Setup = append(out.Setup, statusJSONSetup{
+			Scope: "repo",
 			Repo:  filepath.Base(p.Repo),
 			Steps: len(p.Setup),
 		})
@@ -263,6 +282,15 @@ func renderStatusDashboard(w io.Writer, provider sandbox.Provider, sb *config.Sa
 		}
 		fmt.Fprintf(w, "  Forwards    %s\n", strings.Join(parts, ", "))
 	}
+	// Arrow drawn guest→host so the two rows read in the direction traffic
+	// flows; without that a reader has no way to tell them apart.
+	if len(sb.ReverseForwards) > 0 {
+		parts := make([]string, 0, len(sb.ReverseForwards))
+		for _, f := range sb.ReverseForwards {
+			parts = append(parts, fmt.Sprintf("%d → %d", f.GuestPort, f.HostPort))
+		}
+		fmt.Fprintf(w, "  Reverse     %s (guest → host loopback)\n", strings.Join(parts, ", "))
+	}
 
 	// One line per policy layer, lowest precedence first: the use chain,
 	// then the sandbox's own blocks with entry counts. Full contents live
@@ -302,6 +330,9 @@ func renderStatusDashboard(w io.Writer, provider sandbox.Provider, sb *config.Sa
 	}
 
 	var setupBits []string
+	if len(sb.Setup) > 0 {
+		setupBits = append(setupBits, fmt.Sprintf("workspace (%d)", len(sb.Setup)))
+	}
 	for _, p := range sb.Phases {
 		if len(p.Setup) == 0 {
 			continue

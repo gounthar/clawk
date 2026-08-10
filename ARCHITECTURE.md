@@ -21,7 +21,7 @@ talks to over sockets.
 3. The daemon builds a `machine.Spec` (CPUs, memory, the OCI rootfs disk, the
    network, a vsock device, the serial log), asks the `machine` library for
    the right backend, and boots the VM. It also brings up gvproxy and, on
-   macOS, the agent proxy and ssh-agent proxy.
+   macOS, the agent proxy, the ssh-agent proxy, and the reverse-forward proxy.
 
 `clawk` / `clawk run <runner>` then connect to the **in-guest pty-agent over
 vsock** (AF_VSOCK port 1024). Each attach spawns a fresh child in the guest and
@@ -63,6 +63,17 @@ adds the filter hooks). Two attachment modes, abstracted by `machine.UserMode`:
   between gvproxy's unixgram socket and the guest's TAP across an IP-less L2
   bridge (`machine/firecracker/usermode_linux.go`).
 
+Port forwards go both ways, by two different mechanisms. Outbound
+(`clawk forward add`) is a gvproxy binding on the host's loopback, fixed when
+the VM starts. Inbound (`clawk forward add-reverse`) can't be: a guest process
+dialling `127.0.0.1` reaches the guest's own loopback, with no route to the
+host's. So the guest agent binds the port itself and tunnels each connection
+over vsock to the daemon, which validates the requested port against the
+sandbox's configured set before dialling the host service (`internal/revfwd`
+for the protocol, `internal/cli/reverse_forward.go` for the host end). The
+daemon pushes set changes down the same channel, so those edits apply to a
+running guest. vz only — firecracker's vsock is one-way.
+
 Live allow-list edits reach the running daemon over a control socket
 (`internal/vzdctl`); when the sandbox is down they apply on the next `up`.
 The same socket carries the VM lifecycle verbs: `clawk pause` / `resume`
@@ -93,6 +104,7 @@ because it pins a vendored `gvisor-tap-vsock` fork; everything clawk-specific
 | `internal/template` | `clawk.mod` lexer + parser (typed `sandbox` / `policy` / `namespace` blocks). |
 | `internal/agentembed` | The in-guest binaries (clawk-init, pty-agent, time-sync), cross-compiled and injected into the rootfs. |
 | `internal/vsockproto` / `internal/vsockclient` | The host↔guest vsock framing and the host-side client. |
+| `internal/revfwd` | Reverse-forward wire protocol (host loopback services exposed on the guest's loopback), mirrored in the guest agent. |
 | `internal/netfilter` | Egress allow-list (IPs/CIDRs/domains, DNS-aware) consumed by gvproxy. |
 | `internal/vzdctl` | Daemon control socket (live policy edits, denial ledger, VM pause/resume/suspend). |
 | `internal/worktree` / `internal/pr` | Multi-repo branch coordination and PR creation. |

@@ -97,12 +97,20 @@ func runVzd(_ *cobra.Command, args []string) (retErr error) {
 	// socket so the endpoints answer "booting" instead of racing.
 	lc := newVMLifecycle(sb.Name, vmDir, logger)
 
+	// Reverse-forward proxy: publishes the sandbox's host-loopback exposures
+	// to the in-guest agent and bridges the connections it opens. Built here,
+	// before the control socket, so `clawk forward add-reverse` has somewhere
+	// to push while the VM is still booting; it starts listening once the
+	// machine exists (below).
+	rev := newReverseProxy(logger)
+	rev.Set(sb.ReverseForwards)
+
 	// Control socket: lets the CLI push network-policy edits into the live
 	// allow list (`clawk network allow` without a down/up cycle), read
-	// the denial ledger (`clawk network denials`), and drive the VM
-	// lifecycle (`clawk pause/resume/snapshot`). Best-effort — without
-	// it, policy edits apply on the next up, as before.
-	ctl, err := vzdctl.Start(vzdctl.SocketPath(vmDir), controlHandlers(sb, allow, lc, logger))
+	// the denial ledger (`clawk network denials`), push reverse-forward
+	// edits, and drive the VM lifecycle (`clawk pause/resume/snapshot`).
+	// Best-effort — without it, policy edits apply on the next up, as before.
+	ctl, err := vzdctl.Start(vzdctl.SocketPath(vmDir), controlHandlers(sb, allow, lc, rev, logger))
 	if err != nil {
 		logger.Printf("control socket: disabled (%v) — network edits apply on next up", err)
 	} else {
@@ -195,6 +203,16 @@ func runVzd(_ *cobra.Command, args []string) (retErr error) {
 		logger.Printf("ssh-agent-proxy: disabled (%v)", err)
 	} else if sshAgent != nil {
 		defer sshAgent.Stop()
+	}
+
+	// Reverse forwards: the guest agent dials this listener to learn which
+	// host loopback ports to bind on its own 127.0.0.1, and again for every
+	// connection to one. Best-effort — a failure here means those ports
+	// simply don't appear inside the guest.
+	if err := rev.Start(ctx, m); err != nil {
+		logger.Printf("reverse-forward: disabled (%v)", err)
+	} else {
+		defer rev.Stop()
 	}
 
 	// 9p cache servers: one per toolchain cache, each serving its host cache

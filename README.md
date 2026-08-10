@@ -235,6 +235,8 @@ Anthropic, …) are pre-allowed, and the filter is DNS-aware, so allowing
 clawk network allow my-project api.stripe.com '*.internal.mycorp.com' 10.0.0.5
 clawk network denials my-project     # what the agent tried that got blocked
 clawk forward add my-project 3000    # localhost:3000 → the guest's dev server
+clawk forward add-reverse my-project 63342   # and the other way: a service on YOUR
+                                             # localhost, reachable inside the guest
 ```
 
 Denials are recorded by the *hostname the guest resolved*, so `clawk network

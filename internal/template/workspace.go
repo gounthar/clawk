@@ -144,10 +144,11 @@ func loadWorkspaceParsed(abs string, f *File, profile string) (*Workspace, error
 	if tmpl == nil {
 		tmpl = &Template{}
 	}
-	// Lifecycle hooks belong elsewhere; flag them to guide migrations.
-	// `on create / on up / on down / on enter` are repo-local because each
-	// phase has its own worktree and tooling — running them at workspace scope
-	// would be ambiguous about CWD.
+	// `on up` and `on create` are allowed at workspace scope — they run at the
+	// guest workspace root, the VM-wide slot for provisioning shared across
+	// every phase (see rejectLifecycleAtWorkspace). `on down` / `on enter`
+	// stay rejected: they're reserved and wired nowhere, so accepting them
+	// here would silently swallow config that never runs.
 	if err := rejectLifecycleAtWorkspace(abs, tmpl); err != nil {
 		return nil, err
 	}
@@ -468,18 +469,22 @@ func (w *Workspace) FilterRepos(only []string) (*Workspace, error) {
 	return &Workspace{Root: w.Root, File: w.File, Repos: kept, Policies: w.Policies}, nil
 }
 
-// rejectLifecycleAtWorkspace flags any of the four `on <event>` lists set
-// on a workspace-position template. Lifecycle hooks are repo-local because
-// each phase has its own worktree and tool ecosystem — running them at
-// workspace scope would be ambiguous about which CWD applies.
+// rejectLifecycleAtWorkspace flags the `on <event>` lists that stay repo-local
+// on a workspace-position template.
+//
+// `on up` and `on create` are the deliberate exceptions and are NOT rejected:
+// a workspace-level hook runs at the guest workspace root (the parent of every
+// phase worktree), which is exactly what VM-wide, CWD-independent provisioning
+// wants — a swapfile, a global toolchain, a shared daemon. They ride on
+// Sandbox.Setup / Sandbox.OnCreate and run before the per-phase hooks (see
+// cli's runWorkspaceOnUp and runPhaseOnCreate).
+//
+// `on down` and `on enter` are reserved and wired nowhere yet (see the
+// Template doc); accepting them at workspace scope would silently swallow
+// config that never runs, so they stay rejected until the feature lands and
+// their workspace semantics can be designed alongside it.
 func rejectLifecycleAtWorkspace(path string, tmpl *Template) error {
 	switch {
-	case len(tmpl.OnCreate) > 0:
-		return fmt.Errorf(
-			"%s: 'on create' belongs in a per-repo clawk.mod, not the workspace", path)
-	case len(tmpl.OnUp) > 0:
-		return fmt.Errorf(
-			"%s: 'on up' (or legacy 'setup') belongs in a per-repo clawk.mod, not the workspace", path)
 	case len(tmpl.OnDown) > 0:
 		return fmt.Errorf(
 			"%s: 'on down' belongs in a per-repo clawk.mod, not the workspace", path)

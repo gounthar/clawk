@@ -87,7 +87,11 @@ func runFcd(_ *cobra.Command, args []string) (retErr error) {
 	// (`clawk network allow` with no down/up), read the denial ledger, and
 	// drive the VM lifecycle (`clawk pause/resume/snapshot`).
 	// Best-effort — without it, edits apply on the next up, as before.
-	ctl, err := vzdctl.Start(vzdctl.SocketPath(vmDir), controlHandlers(sb, allow, lc, logger))
+	//
+	// No reverse-forward sink: firecracker's vsock is one-way (guest listens,
+	// host dials), so there is nothing for the guest agent to dial. The
+	// endpoint 404s and the CLI says so.
+	ctl, err := vzdctl.Start(vzdctl.SocketPath(vmDir), controlHandlers(sb, allow, lc, nil, logger))
 	if err != nil {
 		logger.Printf("control socket: disabled (%v) — network edits apply on next up", err)
 	} else {

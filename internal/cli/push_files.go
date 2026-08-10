@@ -77,21 +77,28 @@ func pushOneHostFile(sp sandbox.ShellProvider, sb *config.Sandbox, f config.Host
 
 // buildFilePushScript renders the in-guest shell command that
 // reconstitutes one host file at the given guest path with the given
-// mode. Owned root:root and chowned to agent afterwards so an agent
-// reading credentials doesn't need sudo. `install` is used for atomic
-// publish (write tmpfile in target dir, rename onto destination) so a
-// concurrent reader never sees a partial file.
+// mode, owned by the agent user so credentials are readable without
+// sudo. `install` publishes atomically (write to a temp file in the
+// target dir, rename onto the destination) so a concurrent reader never
+// sees a partial file.
+//
+// The group is resolved at runtime with `id -g <user>` rather than
+// passed as the user's own name: GuestUser ("agent") has no matching
+// group in the guest — its primary group is inherited from the host
+// uid/gid mapping (e.g. gid 20 → "dialout" on a macOS host), so a
+// literal `-g agent` fails with `install: invalid group 'agent'` and
+// the file silently never lands (pushHostFiles only warns).
 func buildFilePushScript(guestPath string, data []byte, mode fs.FileMode) string {
 	encoded := base64.StdEncoding.EncodeToString(data)
 	// Use printf %s to dodge any shell interpretation; pipe into
-	// `base64 -d` (busybox + coreutils both accept it) then `install`
-	// which handles the mkdir-of-parent, mode, and ownership in one step.
+	// `base64 -d` (busybox + coreutils both accept it) then `install`,
+	// which applies the mode and ownership as it writes.
 	return strings.Join([]string{
 		"set -euo pipefail",
 		"dir=" + pushShellQuote(parentDir(guestPath)),
 		"sudo mkdir -p \"$dir\"",
 		fmt.Sprintf(
-			"printf %%s %s | base64 -d | sudo install -o %s -g %s -m %#o /dev/stdin %s",
+			"printf %%s %s | base64 -d | sudo install -o %s -g \"$(id -g %s)\" -m %#o /dev/stdin %s",
 			pushShellQuote(encoded),
 			sandbox.GuestUser, sandbox.GuestUser, mode.Perm(),
 			pushShellQuote(guestPath),

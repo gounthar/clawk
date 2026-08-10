@@ -73,6 +73,9 @@ func TestParseErrors(t *testing.T) {
 		{"provider keyword", "vm (\nprovider provider\n)\n", "reserved"},
 		{"ip without arg", "network (\nallow ip\n)", "expected IP"},
 		{"bare keyword in network entry", "network (\nallow ip 1.2.3.4\nallow vm\n)", "unexpected keyword"},
+		{"bare CIDR in allow suggests 'ip'", "network (\nallow 10.20.0.0/15\n)", "allow ip 10.20.0.0/15"},
+		{"bare IP in allow rejected", "network (\nallow 10.0.0.5\n)", "is an IP or CIDR"},
+		{"bare CIDR in deny suggests 'ip'", "network (\ndeny 192.168.0.0/24\n)", "deny ip 192.168.0.0/24"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -112,6 +115,36 @@ func TestParseForwards(t *testing.T) {
 	if len(tmpl.Forwards) != 2 || tmpl.Forwards[0] != "3000" || tmpl.Forwards[1] != "8080:80" {
 		t.Errorf("forwards parsed wrong: %v", tmpl.Forwards)
 	}
+}
+
+// TestParseReverseForwards: `reverse` inside a forwards block sorts the
+// entry into the inbound list, leaving plain entries where they were.
+func TestParseReverseForwards(t *testing.T) {
+	src := `forwards (
+    3000
+    reverse 63342
+    reverse 5432:15432
+    8080:80
+)
+`
+	tmpl, err := parseBody(src)
+	require.NoError(t, err)
+	require.Equal(t, []string{"3000", "8080:80"}, tmpl.Forwards)
+	require.Equal(t, []string{"63342", "5432:15432"}, tmpl.ReverseForwards)
+}
+
+func TestParseReverseForwardInline(t *testing.T) {
+	tmpl, err := parseBody("forwards reverse 63342\n")
+	require.NoError(t, err)
+	require.Empty(t, tmpl.Forwards)
+	require.Equal(t, []string{"63342"}, tmpl.ReverseForwards)
+}
+
+// A bare `reverse` must not silently swallow the next entry.
+func TestParseReverseForwardNeedsSpec(t *testing.T) {
+	_, err := parseBody("forwards (\n    reverse\n    3000\n)\n")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "expected a port spec after 'reverse'")
 }
 
 // TestParseInlineForms checks the go.mod-style syntax where single-entry
@@ -206,6 +239,7 @@ func TestParseResources(t *testing.T) {
     cpu        8
     memory     2GiB
     memory_max 16GiB
+    disk       64GiB
 )
 `
 	tmpl, err := parseBody(src)
@@ -218,6 +252,9 @@ func TestParseResources(t *testing.T) {
 	}
 	if tmpl.MemoryMaxMiB != 16384 {
 		t.Errorf("memory_max = %d MiB, want 16384", tmpl.MemoryMaxMiB)
+	}
+	if tmpl.DiskMiB != 64*1024 {
+		t.Errorf("disk = %d MiB, want %d", tmpl.DiskMiB, 64*1024)
 	}
 }
 
