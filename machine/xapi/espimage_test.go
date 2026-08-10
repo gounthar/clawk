@@ -100,6 +100,13 @@ func TestRejectsLongNames(t *testing.T) {
 // and `sfdisk` when written; keeping it here is what stops a later change to
 // the writer from silently agreeing with itself.
 func readBack(t *testing.T, img []byte) map[string][]byte {
+	files, _ := readBackWithDots(t, img)
+	return files
+}
+
+// readBackWithDots also returns the first-cluster value of every "." and ".."
+// entry, keyed by path, so tests can assert FAT's rule about them.
+func readBackWithDots(t *testing.T, img []byte) (map[string][]byte, map[string]uint32) {
 	t.Helper()
 	bs := img[espFirstLBA*sectorSize:]
 	bps := uint32(binary.LittleEndian.Uint16(bs[11:]))
@@ -130,6 +137,7 @@ func readBack(t *testing.T, img []byte) map[string][]byte {
 	require.Equal(t, f1, f2, "the two FAT copies must be identical")
 
 	out := map[string][]byte{}
+	dots := map[string]uint32{}
 	var walk func(cluster uint32, prefix string)
 	walk = func(cluster uint32, prefix string) {
 		for _, c := range chain(cluster) {
@@ -153,7 +161,13 @@ func readBack(t *testing.T, img []byte) map[string][]byte {
 					uint32(binary.LittleEndian.Uint16(e[26:]))
 				size := binary.LittleEndian.Uint32(e[28:])
 				if e[11]&attrDirectory != 0 {
+					// Record the dot entries rather than skipping
+					// them. Skipping is what let a bad ".." through:
+					// the entries exist purely to be read by the
+					// firmware, so a reader that ignores them cannot
+					// tell a correct image from a corrupt one.
 					if full == "." || full == ".." {
+						dots[prefix+"/"+full] = first
 						continue
 					}
 					walk(first, prefix+"/"+full)
@@ -168,7 +182,7 @@ func readBack(t *testing.T, img []byte) map[string][]byte {
 		}
 	}
 	walk(root, "")
-	return out
+	return out, dots
 }
 
 func TestFilesRoundTrip(t *testing.T) {
@@ -182,6 +196,69 @@ func TestFilesRoundTrip(t *testing.T) {
 	require.Equal(t, kernel, got["/EFI/BOOT/BOOTX64.EFI"])
 	require.Equal(t, initrd, got["/INITRD.IMG"])
 	require.Len(t, got, 2)
+}
+
+// TestDotDotOfRootChildIsZero pins a FAT rule that is easy to get wrong and
+// invisible to anything that does not read the dot entries.
+//
+// The ".." of a directory whose parent is the root must carry first cluster 0,
+// not the root's actual cluster number. Writing 2 produces an image that reads
+// back correctly with a naive parser and that fsck.fat and strict firmware
+// both call corrupt.
+func TestDotDotOfRootChildIsZero(t *testing.T) {
+	_, dots := readBackWithDots(t, sampleImage(t))
+
+	require.Equal(t, uint32(0), dots["/EFI/.."],
+		"a directory directly under the root must have .. pointing at cluster 0")
+
+	// One level deeper the rule reverses: EFI/BOOT's parent is a real
+	// directory, so ".." carries its actual cluster.
+	require.NotZero(t, dots["/EFI/BOOT/.."],
+		"a directory below a non-root parent must have .. pointing at that parent")
+
+	// "." always names the directory holding it.
+	require.NotZero(t, dots["/EFI/."])
+	require.Equal(t, dots["/EFI/."], dots["/EFI/BOOT/.."],
+		"EFI/BOOT's .. must be EFI's own cluster")
+}
+
+func TestZeroLengthFile(t *testing.T) {
+	img, err := buildESPImage([]espFile{
+		{Dir: "", Name: "BOOTX64.EFI", Data: []byte("x")},
+		{Dir: "", Name: "EMPTY.TXT", Data: nil},
+	})
+	require.NoError(t, err)
+
+	got := readBack(t, img)
+	// A zero-length file owns no clusters and records first cluster 0. It
+	// must still appear, with no bytes.
+	require.Contains(t, got, "/EMPTY.TXT")
+	require.Empty(t, got["/EMPTY.TXT"])
+}
+
+func TestRejectsMalformedNames(t *testing.T) {
+	for _, tc := range []struct{ name, why string }{
+		{"BOOT X64.EFI", "space is not legal in a short name"},
+		{"BOOT+X64.EFI", "plus is reserved by FAT"},
+		{"BOOT[1].EFI", "brackets are reserved by FAT"},
+		{"BOOTX64.", "trailing dot with no extension"},
+		{"BOOTX64.EFIX", "extension longer than three characters"},
+		{".EFI", "empty stem"},
+	} {
+		_, err := buildESPImage([]espFile{{Name: tc.name, Data: []byte("x")}})
+		require.Error(t, err, tc.why)
+	}
+}
+
+func TestRejectsMalformedDirs(t *testing.T) {
+	// splitDir turns each of these into an empty segment, which must be
+	// refused rather than producing a directory entry named "        ".
+	for _, dir := range []string{"/EFI", "EFI/", "EFI//BOOT"} {
+		_, err := buildESPImage([]espFile{
+			{Dir: dir, Name: "BOOTX64.EFI", Data: []byte("x")},
+		})
+		require.Error(t, err, "dir %q must be rejected", dir)
+	}
 }
 
 func TestReproducible(t *testing.T) {

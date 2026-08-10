@@ -163,9 +163,15 @@ func layoutFAT(files []espFile) (*fatLayout, error) {
 	dirPaths := collectDirs(files)
 
 	// Cluster 2 is the root directory. Directories then files follow.
+	//
+	// The root is recorded as cluster 0 here, not 2, and that is not a typo.
+	// FAT requires the ".." entry of a directory whose parent is the root to
+	// carry first cluster 0 rather than the root's actual cluster number. The
+	// value in this map feeds exactly that entry, so storing 2 would write a
+	// ".." that strict firmware and fsck.fat both read as corruption.
 	next := uint32(2)
 	dirs := make([]fatDir, 0, len(dirPaths)+1)
-	byPath := map[string]uint32{"": 2}
+	byPath := map[string]uint32{"": 0}
 	dirs = append(dirs, fatDir{path: "", cluster: 2, parent: 0})
 	next++
 
@@ -208,13 +214,11 @@ func layoutFAT(files []espFile) (*fatLayout, error) {
 	dataStart := uint32(fatReservedSectors) + fatSectors*fatCount
 	totalSectors := dataStart + clusterCount*sectorsPerCluster
 
-	// Re-check: the volume must still hold at least fat32MinClusters after
-	// the FATs took their share. Growing the volume by the FAT's own size
-	// settles it without a second pass, because the FAT grows by four
-	// bytes per cluster and we are adding whole sectors.
-	if clusterCount < fat32MinClusters {
-		return nil, errors.New("xapi: FAT32 cluster count underflow")
-	}
+	// The volume is sized from clusterCount rather than the other way round,
+	// so the FAT32 floor applied above still holds here by construction:
+	// totalSectors was computed to cover exactly clusterCount clusters after
+	// the FATs took their share. There is deliberately no re-check — an
+	// earlier version had one, and it could not fire.
 
 	l := &fatLayout{
 		totalSectors: totalSectors,
@@ -420,6 +424,14 @@ func pad83(name string) []byte {
 	return out
 }
 
+// validate83 rejects anything that would not survive the trip into an 11-byte
+// short-name directory entry.
+//
+// The character set matters as much as the length. pad83 copies bytes
+// straight into the entry, so a space or one of FAT's reserved punctuation
+// characters would produce a structurally valid entry naming a file the
+// firmware cannot open — a failure that shows up as a boot that does not
+// happen, with nothing in the image obviously wrong.
 func validate83(name string) error {
 	if name == "" {
 		return errors.New("empty name")
@@ -431,13 +443,35 @@ func validate83(name string) error {
 	if hasDot && len(ext) > 3 {
 		return errors.New("extension must be 0-3 characters")
 	}
+	if hasDot && len(ext) == 0 {
+		return errors.New("trailing dot with no extension")
+	}
 	if strings.Contains(ext, ".") {
 		return errors.New("only one dot allowed")
 	}
 	if name != strings.ToUpper(name) {
 		return errors.New("must be upper case")
 	}
+	for _, r := range stem + ext {
+		if !valid83Rune(r) {
+			return fmt.Errorf("character %q is not legal in a short name", r)
+		}
+	}
 	return nil
+}
+
+// valid83Rune reports whether r may appear in a FAT short name. The permitted
+// set is A-Z, 0-9 and a short list of punctuation; everything else, including
+// space and the characters FAT reserves for its own syntax, is rejected.
+func valid83Rune(r rune) bool {
+	switch {
+	case r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	case strings.ContainsRune("$%'-_@~`!(){}^#&", r):
+		return true
+	default:
+		return false
+	}
 }
 
 func splitDir(dir string) []string {
