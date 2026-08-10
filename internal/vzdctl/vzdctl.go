@@ -38,6 +38,13 @@ type Handlers struct {
 	// applies it to the live allow list.
 	Reload func() error
 
+	// ReloadForwards, if non-nil, re-reads the sandbox's reverse port
+	// forwards from the store and pushes them to the in-guest agent. Nil
+	// on backends with no vsock listener (firecracker), where the endpoint
+	// reports 404 and the client maps it to
+	// ErrReverseForwardsUnsupported.
+	ReloadForwards func() error
+
 	// Gate, if non-nil, powers the interactive allow/deny endpoints
 	// (/v1/events, /v1/decide, /v1/pending). When nil those endpoints
 	// report 404 and the daemon serves only the denial ledger + reload.
@@ -122,6 +129,21 @@ func Start(path string, h Handlers) (*Server, error) {
 	})
 	mux.HandleFunc("POST /v1/reload", func(w http.ResponseWriter, _ *http.Request) {
 		if err := h.Reload(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /v1/reload-forwards", func(w http.ResponseWriter, _ *http.Request) {
+		// Its own endpoint rather than a second job for /v1/reload: a
+		// daemon that predates reverse forwarding answers /v1/reload
+		// happily, and the CLI would report a live apply that never
+		// happened. A 404 here is the honest answer.
+		if h.ReloadForwards == nil {
+			http.Error(w, "reverse forwarding not supported", http.StatusNotFound)
+			return
+		}
+		if err := h.ReloadForwards(); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -382,6 +404,12 @@ var ErrNotRunning = errors.New("control socket not available (sandbox not runnin
 // errors.Is and suggest a sandbox restart.
 var ErrLifecycleUnsupported = errors.New("daemon does not support lifecycle control (restart the sandbox to upgrade its daemon)")
 
+// ErrReverseForwardsUnsupported reports that the daemon answered but has no
+// reverse-forward endpoint — either it predates the feature or its backend
+// has no host-side vsock listener (firecracker). Callers check with
+// errors.Is.
+var ErrReverseForwardsUnsupported = errors.New("daemon does not support reverse port forwarding")
+
 // Lifecycle fetches the VM's live lifecycle snapshot.
 func (c *Client) Lifecycle(ctx context.Context) (LifecycleState, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://vzd/v1/lifecycle", nil)
@@ -476,6 +504,28 @@ func (c *Client) Reload(ctx context.Context) error {
 		return fmt.Errorf("reload: %s", responseError(resp))
 	}
 	return nil
+}
+
+// ReloadForwards asks the daemon to re-read the sandbox's reverse port
+// forwards from the store and push them to the in-guest agent.
+func (c *Client) ReloadForwards(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://vzd/v1/reload-forwards", nil)
+	if err != nil {
+		return fmt.Errorf("building reload-forwards request: %w", err)
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusNoContent:
+		return nil
+	case http.StatusNotFound:
+		return fmt.Errorf("%w: %s", ErrReverseForwardsUnsupported, responseError(resp))
+	default:
+		return fmt.Errorf("reload-forwards: %s", responseError(resp))
+	}
 }
 
 // Pending fetches the daemon's outstanding interactive holds.

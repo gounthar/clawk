@@ -56,15 +56,28 @@ export -f sudo install
 	require.Equal(t, payload, string(got), "round-trip mismatch")
 }
 
-// TestBuildFilePushScriptUsesAgentOwnership locks the chown user in
-// place — credentials owned by root:root would still work for an agent
-// that's a sudoer but the principle-of-least-surprise expectation is
-// that files placed at /home/agent are owned by agent.
+// TestBuildFilePushScriptUsesAgentOwnership locks in that the pushed
+// file is owned by the agent user (principle of least surprise: files
+// placed at /home/agent are owned by agent), and — critically — that
+// the group is resolved dynamically via `id -g` rather than assumed to
+// share the user's name. GuestUser ("agent") has no matching group in
+// the guest, so a literal `-g agent` makes `install` fail with "invalid
+// group" and the file never lands. This test guards that regression.
 func TestBuildFilePushScriptUsesAgentOwnership(t *testing.T) {
 	script := buildFilePushScript("/home/agent/.kube/cfg", []byte("x"), 0o600)
-	want := "-o " + sandbox.GuestUser + " -g " + sandbox.GuestUser
-	if !strings.Contains(script, want) {
-		t.Errorf("script missing %q:\n%s", want, script)
+
+	wantOwner := "-o " + sandbox.GuestUser + " "
+	if !strings.Contains(script, wantOwner) {
+		t.Errorf("script missing owner %q:\n%s", wantOwner, script)
+	}
+	wantGroup := `-g "$(id -g ` + sandbox.GuestUser + `)"`
+	if !strings.Contains(script, wantGroup) {
+		t.Errorf("script missing dynamic group %q:\n%s", wantGroup, script)
+	}
+	// The literal same-name group is the bug: `install` rejects it
+	// because no such group exists in the guest.
+	if badGroup := "-g " + sandbox.GuestUser + " "; strings.Contains(script, badGroup) {
+		t.Errorf("script uses literal group %q, which fails as `install: invalid group`:\n%s", badGroup, script)
 	}
 }
 

@@ -87,3 +87,62 @@ interface is not visible to the host.
 Note that an idle-stopped VM's port forwards go away until the next boot —
 give a sandbox that must keep serving `idle_timeout off` (see
 [Commands & resource usage](commands.md#resource-usage)).
+
+### Reverse forwarding (host loopback → guest)
+
+The other direction: a service bound to `127.0.0.1` on your Mac, reachable
+at the *same address* inside the guest. Allow-listing its IP doesn't help —
+`127.0.0.1` in the guest is the guest's own loopback, and there is no route
+from there to yours.
+
+```sh
+clawk forward add-reverse    <sandbox> 63342        # guest 127.0.0.1:63342 → host 127.0.0.1:63342
+clawk forward add-reverse    <sandbox> 5432:15432   # guest 127.0.0.1:15432 → host 127.0.0.1:5432
+clawk forward remove-reverse <sandbox> 63342
+```
+
+Specs read host-side first in both directions, so `5432:15432` names the
+same pair of ports whichever verb you use — only who dials whom changes.
+
+Two things differ from outbound forwards:
+
+- **They apply immediately.** Outbound forwards are a gvproxy binding fixed
+  at VM start; reverse forwards are tunnelled over vsock by the daemon and
+  pushed to the running guest, so no `down`/`up` cycle is needed.
+- **Only the listed ports are reachable.** The guest names a port, never an
+  address, and the host refuses one that isn't configured — so this opens
+  exactly the holes you asked for, not your whole loopback.
+
+vz only. firecracker's vsock is one-way (guest listens, host dials), so
+there is nothing for the guest to connect back through; the CLI says so
+rather than silently doing nothing.
+
+Reverse forwards can also be declared in `clawk.mod` — see
+[Configuration](configuration.md#reference).
+
+### Recipe: the Claude Code IDE plugin
+
+The JetBrains and VS Code plugins run a websocket server on the host's
+loopback and advertise it in `~/.claude/ide/<port>.lock`. A `claude` running
+inside a sandbox needs two things to find it — the lock file, and a route to
+the port:
+
+```sh
+# 1. share the host's lock-file dir into the guest (clawk.mod, or clawk apply)
+#    shares (
+#        ~/.claude/ide  /home/agent/.claude/ide  ro
+#    )
+
+# 2. reverse-forward the port the lock file names
+ls ~/.claude/ide                                  # 63342.lock
+clawk forward add-reverse my-project 63342
+```
+
+Then `/ide` inside the sandbox connects as it would on the host. The port is
+per-IDE-window and changes when the IDE restarts; because reverse forwards
+apply live, re-running `add-reverse` with the new port is enough — no
+sandbox restart.
+
+Note that the guest's `~/.claude` is the sandbox's own state directory, not
+your host `~/.claude`; the share above is what puts the host's lock files
+where the guest's `claude` looks.

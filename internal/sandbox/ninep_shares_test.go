@@ -7,6 +7,9 @@ import "testing"
 // non-zero vsock port starting at NinepBasePort, clear of the fixed control
 // ports. If these drift, host servers and guest mounts stop agreeing.
 func TestToolchainCacheSharesPorts(t *testing.T) {
+	if !ToolchainCachesEnabled {
+		t.Skip("toolchain cache shares are disabled (see ToolchainCachesEnabled)")
+	}
 	shares := ToolchainCacheShares(t.TempDir())
 	if len(shares) == 0 {
 		t.Fatal("ToolchainCacheShares returned nothing")

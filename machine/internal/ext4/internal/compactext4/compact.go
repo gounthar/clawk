@@ -1258,11 +1258,22 @@ func TotalDiskSize(size int64) Option {
 			size = maxMaxDiskSize
 		}
 		w.totalDiskSize = (size + BlockSize - 1) &^ (BlockSize - 1)
-		// The group-descriptor table is laid out before any content is
-		// written, so the metadata reservation must cover the padded size
-		// up front.
-		if w.totalDiskSize > w.maxDiskSize {
-			w.maxDiskSize = w.totalDiskSize
+		// The max addressable size must exceed the padded total by a metadata
+		// margin. The inode table, bitmaps, and the backup superblock+GDT
+		// copies in the trailing block groups are all addressed within the
+		// disk — the final backup lands just short of the end — so pinning
+		// maxDiskSize to exactly the padded total overflows during finalize.
+		// A 1/8 margin (mirroring the free-space slack heuristic in Close)
+		// covers it. Keep the existing reservation when it already provides
+		// the margin, so small images retain the 16 GiB default unchanged;
+		// only the tiny group-descriptor reservation scales with this, not
+		// the inode table (which is sized from totalDiskSize).
+		need := w.totalDiskSize + w.totalDiskSize/8
+		if need > maxMaxDiskSize {
+			need = maxMaxDiskSize
+		}
+		if need > w.maxDiskSize {
+			w.maxDiskSize = need
 		}
 	}
 }
@@ -1404,8 +1415,11 @@ func (w *Writer) Close() error {
 	// builds, large npm/pnpm trees) then hits ENOSPC with gigabytes of
 	// blocks still free. Match mkfs.ext4's default ratio of one inode per
 	// 16 KiB of disk so the inode count scales with the space the guest
-	// actually has. The extra inode-table slots are zero and sparse on the
-	// host, so this only costs metadata.
+	// actually has. Note this is the one part of a padded image that is NOT
+	// a hole: the table is written out at 256 bytes per inode, so it costs
+	// roughly 1/64 of the requested disk size in real host bytes (~512 MiB
+	// for a 32 GiB rootfs). That is the standing price of the padding —
+	// callers picking a ceiling should budget for it.
 	inodeTarget := uint32(len(w.inodes))
 	if want := inodesForBlocks(wantBlocks); want > inodeTarget {
 		inodeTarget = want

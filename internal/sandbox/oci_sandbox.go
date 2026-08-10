@@ -40,7 +40,7 @@ func OCIRootFS(sb *config.Sandbox, cacheDir string, bins guestbuild.Binaries) ma
 	return machine.OCIImage{
 		Ref:      sb.Image,
 		CacheDir: filepath.Join(cacheDir, "oci"),
-		SizeMiB:  DefaultDiskSizeGiB << 10,
+		SizeMiB:  RootDiskSizeMiB(sb),
 		Platform: "linux/" + runtime.GOARCH,
 		Inject: []machine.InjectFile{
 			{GuestPath: guestcfg.InitPath, HostPath: bins.Init, Mode: 0o755},

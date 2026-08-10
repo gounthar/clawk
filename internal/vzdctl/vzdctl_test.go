@@ -283,3 +283,49 @@ func TestLifecycleVerbErrorSurfaces(t *testing.T) {
 	// Pause has no handler wired — that specific verb is unsupported.
 	require.ErrorIs(t, c.Pause(context.Background()), ErrLifecycleUnsupported)
 }
+
+func TestReloadForwardsRoundTrip(t *testing.T) {
+	sock := testSocket(t)
+	var reloaded int
+	srv, err := Start(sock, Handlers{
+		Denials:        func() []netfilter.Denial { return nil },
+		Reload:         func() error { return nil },
+		ReloadForwards: func() error { reloaded++; return nil },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { srv.Close() })
+
+	require.NoError(t, NewClient(sock).ReloadForwards(context.Background()))
+	require.Equal(t, 1, reloaded)
+}
+
+// A daemon with no reverse-forward sink (firecracker, or one predating the
+// feature) must say so rather than let the CLI report a live apply that
+// never happened.
+func TestReloadForwardsUnsupported(t *testing.T) {
+	sock := testSocket(t)
+	srv, err := Start(sock, Handlers{
+		Denials: func() []netfilter.Denial { return nil },
+		Reload:  func() error { return nil },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { srv.Close() })
+
+	err = NewClient(sock).ReloadForwards(context.Background())
+	require.ErrorIs(t, err, ErrReverseForwardsUnsupported)
+}
+
+func TestReloadForwardsErrorSurfaces(t *testing.T) {
+	sock := testSocket(t)
+	srv, err := Start(sock, Handlers{
+		Denials:        func() []netfilter.Denial { return nil },
+		Reload:         func() error { return nil },
+		ReloadForwards: func() error { return errors.New("record vanished") },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { srv.Close() })
+
+	err = NewClient(sock).ReloadForwards(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "record vanished")
+}

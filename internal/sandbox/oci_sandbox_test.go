@@ -160,3 +160,19 @@ func TestOCIRootFS(t *testing.T) {
 		t.Errorf("inject = %+v", r.Inject)
 	}
 }
+
+// TestOCIRootFSDiskOverride confirms a per-sandbox DiskMiB flows into the
+// ext4 SizeMiB floor, and that zero falls back to the default ceiling.
+func TestOCIRootFSDiskOverride(t *testing.T) {
+	bins := guestbuild.Binaries{Init: "/c/i", Agent: "/c/a", TimeSync: "/c/t"}
+
+	over := OCIRootFS(&config.Sandbox{Name: "box", Image: "alpine:3.20", DiskMiB: 64 * 1024}, "/c", bins)
+	if over.SizeMiB != 64*1024 {
+		t.Errorf("override SizeMiB = %d, want %d", over.SizeMiB, 64*1024)
+	}
+
+	def := OCIRootFS(&config.Sandbox{Name: "box", Image: "alpine:3.20"}, "/c", bins)
+	if def.SizeMiB != DefaultDiskSizeGiB<<10 {
+		t.Errorf("default SizeMiB = %d, want %d", def.SizeMiB, DefaultDiskSizeGiB<<10)
+	}
+}

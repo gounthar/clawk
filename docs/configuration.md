@@ -35,6 +35,7 @@ sandbox my-project (
         cpu        4
         memory     4GiB
         memory_max 8GiB
+        disk       64GiB
         nested
         image      golang:1.25
     )
@@ -48,6 +49,7 @@ sandbox my-project (
     forwards (
         3000
         5432:5432
+        reverse 63342                    # the host's localhost:63342, inside the guest
     )
 
     files (
@@ -100,16 +102,27 @@ sandbox my-project (
 - `sandbox <name> ( … )` — the header names the template (defaults to the
   directory when omitted: `sandbox ( … )`).
 - `vm ( … )` — runtime shape: `provider`, `cpu`, `memory`, `memory_max`,
-  `nested`, `idle_timeout`, `image`, `kernel`. Memory sizes require an
-  explicit unit, case-sensitive: IEC (`MiB`/`GiB`/`TiB`, shorthands
-  `M`/`G`/`T`) or SI (`MB`/`GB`/`TB`); SI values convert to MiB rounding
-  down (`1GB` → 953 MiB). See [Images](images.md) for `image` and
-  `kernel`, and
+  `disk`, `nested`, `idle_timeout`, `image`, `kernel`. Memory and `disk`
+  sizes require an explicit unit, case-sensitive: IEC (`MiB`/`GiB`/`TiB`,
+  shorthands `M`/`G`/`T`) or SI (`MB`/`GB`/`TB`); SI values convert to MiB
+  rounding down (`1GB` → 953 MiB). `disk` sets the root filesystem ceiling
+  (default 32 GiB, minimum 1 GiB); it's a sparse ext4 image, so most of a
+  bigger value costs nothing until the guest writes into it — budget about
+  1/64 of the ceiling (~512 MiB at 32 GiB) for the inode table, which is
+  written up front. Raise it for repos with large dependency trees. Like
+  `cpu` and `memory`, the value is snapshotted when the sandbox is created
+  and baked into the rootfs, so editing it affects the next sandbox (or the
+  next rootfs rebuild), not a running one. See [Images](images.md) for
+  `image` and `kernel`, and
   [Commands & resource usage](commands.md#resource-usage) for `idle_timeout`.
 - `network ( … )` — egress policy: `allow` / `deny` a domain or `ip <addr>`,
   plus `use <policy>…` chains — see
   [Networking](networking.md#policies-and-use-chains).
-- `forwards ( … )` — port forwards (`PORT` or `HOST:GUEST`).
+- `forwards ( … )` — port forwards (`PORT` or `HOST:GUEST`). An entry
+  prefixed with `reverse` points the other way: a service on the host's
+  `127.0.0.1` becomes reachable at the same address inside the guest. Same
+  host-first spelling either way — see
+  [Networking](networking.md#reverse-forwarding-host-loopback--guest).
 - `env ( … )` — environment variables to export inside the VM. Secret
   *values* come from your shell at boot and are never written to disk on the
   host; only names, defaults, and literals live in the file. Each entry uses
@@ -134,7 +147,11 @@ sandbox my-project (
   the first boot; `up` runs on every boot. Each command runs inside the
   guest via `bash -lc` as a login shell: variable expansion, globs, and
   pipes follow bash semantics, and `/etc/profile.d` (including forwarded
-  env vars) is sourced first. This is contract — hooks may rely on it.
+  env vars) is sourced first. This is contract — hooks may rely on it. In a
+  per-repo block they run in that repo's worktree; in a
+  [workspace root](#workspace-roots) they run once at the workspace root —
+  the VM-wide slot for setup shared across every repo (a swapfile, a global
+  toolchain). (`on down` / `on enter` are reserved and not wired yet.)
 - `files ( … )` — host files copied into the guest on each `up` (credentials,
   configs that rotate rarely).
 - `shares ( … )` — host directories live-mounted via virtio-fs (good for
@@ -162,6 +179,7 @@ A workspace root is the same block with `includes ( … )`:
 sandbox acme (
     includes ( ./api ./web ./infra )
     network ( use default corp-egress )
+    on up ( "scripts/ensure-swap.sh" )
 )
 
 policy corp-egress (
@@ -172,6 +190,13 @@ policy corp-egress (
 `policy <name> ( … )` blocks beside the sandbox define the named network
 policies its `use` line references; they register into the host store when
 the sandbox is created.
+
+A workspace root may carry `on up` / `on create` hooks (only these two —
+`on down` / `on enter` stay per-repo). They run once at the workspace root,
+before each repo's own hooks, so it's the place for VM-wide setup that isn't
+tied to any single repo's directory. A repo listed in `includes` keeps its
+own per-worktree `on up` / `on create`; the two scopes are independent and
+both run.
 
 ## How clawk finds the file
 

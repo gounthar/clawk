@@ -5,6 +5,7 @@ package compactext4
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -93,6 +94,72 @@ func TestTotalDiskSize(t *testing.T) {
 	require.NoError(t, err)
 	physical := st.Blocks * 512
 	require.LessOrEqual(t, physical, int64(total/4), "physical footprint %d bytes; want sparse (< %d)", physical, total/4)
+}
+
+// TestTotalDiskSizePastDefaultReservation covers padded sizes at and above
+// defaultMaxDiskSize (16 GiB), the regime every clawk rootfs now lands in:
+// sandbox.DefaultDiskSizeGiB is 32, and `vm ( disk <size> )` goes higher.
+//
+// This is a regression test. TotalDiskSize used to raise maxDiskSize to
+// exactly the padded total, which leaves no room for the metadata addressed
+// within the disk (inode table, bitmaps, and the trailing block groups'
+// backup superblock+GDT), so finalize overflowed with "disk exceeded maximum
+// size" — every size >= 16 GiB failed to build at all. The reservation now
+// carries a 1/8 margin above the padded total.
+//
+// The padded tail is a hole, so each case builds in a fraction of a second —
+// but note the physical cost is NOT zero: the inode table is materialized up
+// front at one 256-byte inode per bytesPerInode of disk, i.e. ~1/64 of the
+// requested ceiling (a 32 GiB rootfs writes ~512 MiB). The assertions below
+// pin that ratio so a change to inode sizing can't quietly turn a generous
+// ceiling into a proportional host-disk charge.
+func TestTotalDiskSizePastDefaultReservation(t *testing.T) {
+	const gib = 1024 * mib
+	for _, total := range []int64{
+		defaultMaxDiskSize,       // exactly the old reservation: the boundary
+		defaultMaxDiskSize + gib, // just past it
+		32 * gib,                 // sandbox.DefaultDiskSizeGiB
+		64 * gib,                 // a plausible `vm ( disk 64GiB )`
+	} {
+		t.Run(fmt.Sprintf("%dGiB", total/gib), func(t *testing.T) {
+			image := filepath.Join(t.TempDir(), "fs.img")
+			buildImage(t, image, []testFile{
+				{Path: "etc", File: &File{Mode: format.S_IFDIR | 0o755}},
+				{Path: "etc/hostname", File: &File{Mode: 0o644}, Data: []byte("box\n")},
+			}, Writable, TotalDiskSize(total))
+			fsck(t, image)
+
+			sb := readSuperBlock(t, image)
+			got := int64(sb.BlocksCountLow) * BlockSize
+			require.GreaterOrEqual(t, got, total,
+				"filesystem spans %d bytes, want >= %d", got, total)
+
+			info, err := os.Stat(image)
+			require.NoError(t, err)
+			require.Equal(t, got, info.Size(), "file size != filesystem size")
+
+			// Inodes must scale with the disk, not the two files written,
+			// or a large rootfs hits ENOSPC with blocks still free.
+			require.GreaterOrEqual(t, int64(sb.InodesCount), total/bytesPerInode*3/4,
+				"InodesCount = %d, want ~%d for a %d-byte disk",
+				sb.InodesCount, total/bytesPerInode, total)
+
+			// The padded tail must stay a hole: physical usage tracks the
+			// inode table (~total/64), not the apparent size. Asserted with
+			// 2x slack over that so the check is about "sparse, proportional
+			// to metadata" rather than an exact byte count.
+			var st syscall.Stat_t
+			require.NoError(t, syscall.Stat(image, &st))
+			physical := st.Blocks * 512
+			inodeTable := int64(sb.InodesCount) * inodeSize
+			require.Less(t, physical, total/32,
+				"physical footprint %d bytes; want sparse (~inode table %d, << apparent %d)",
+				physical, inodeTable, got)
+			require.Less(t, physical, inodeTable*2,
+				"physical footprint %d bytes exceeds twice the inode table (%d) — something beyond metadata is being written",
+				physical, inodeTable)
+		})
+	}
 }
 
 // TestTotalDiskSizeContentWins checks that content larger than the requested

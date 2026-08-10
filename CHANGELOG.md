@@ -7,7 +7,30 @@ tagged.
 
 ## Unreleased
 
+## v0.3.0
+
 ### Added
+
+- **Reverse port forwarding: host loopback services, reachable in the guest.**
+  `clawk forward add-reverse <sandbox> 63342` makes whatever is bound to
+  `127.0.0.1:63342` on your Mac answer at the same address inside the sandbox
+  (`5432:15432` maps across ports, host-side first, same as `forward add`).
+  Allow-listing couldn't do this — `127.0.0.1` in the guest is the guest's own
+  loopback — so the guest agent binds the port and tunnels each connection to
+  the daemon over vsock, which dials the host service. Only the ports you list
+  are reachable; the rest of your loopback isn't.
+
+  Unlike outbound forwards these apply to a running sandbox immediately, which
+  matters for the case that motivated it: the Claude Code IDE plugins
+  advertise a per-window websocket port in `~/.claude/ide/<port>.lock`, so
+  reconnecting after an IDE restart is one `add-reverse`, not a VM cycle.
+  Share `~/.claude/ide` into the guest and `/ide` works from inside the
+  sandbox — recipe in [docs/networking.md](docs/networking.md#recipe-the-claude-code-ide-plugin).
+
+  Declarable in `clawk.mod` as a `reverse` entry inside `forwards ( … )`.
+  `clawk status` and `forward list --json` show both directions. vz only:
+  firecracker's vsock is one-way, and the CLI says so rather than silently
+  doing nothing.
 
 - **Linux firecracker sandboxes boot without sudo.** Each sandbox's network
   now lives in its own unprivileged user + network namespace, where clawk has
@@ -45,8 +68,40 @@ tagged.
   required (failing sandbox creation with a message when missing), and a bare
   or quoted right-hand side (`EDITOR = vim`) sets a literal constant. Bare
   `NAME` passthrough is unchanged.
+- **Workspace-level `on up` / `on create` hooks.** A workspace root (a
+  `clawk.mod` whose sandbox block has `includes`) may now declare `on up` and
+  `on create`, which run once at the guest workspace root — before each repo's
+  own hooks — the VM-wide slot for setup shared across every repo (a swapfile,
+  a global toolchain). Previously both were rejected there as repo-local.
+  `on down` / `on enter` stay per-repo (they're reserved and not wired yet).
+- **`vm ( disk <size> )` sets the root-disk ceiling.** Same unit rules as
+  `memory`, minimum 1 GiB, and — like `cpu`/`memory` — resolved as the max
+  across a workspace and its repos, since one rootfs is shared by every phase.
+  Snapshotted at create and baked into the rootfs at build time.
 
 ### Changed
+
+- **Default root disk is 32 GiB, up from 8.** Dependency caches now live on
+  the per-VM rootfs (see below), and 8 GiB filled mid-build. The image is
+  sparse, so the guest's unwritten tail is a hole — but the ceiling is not
+  free: the inode table is written up front at ~1/64 of the ceiling, so a
+  built rootfs costs ~512 MiB of host disk instead of ~128 MiB. That charge
+  lands once per distinct image+size cache entry; per-VM disks reflink off it.
+
+  This changes the rootfs cache key, so the **first `clawk up` after
+  upgrading rebuilds the rootfs** for every existing sandbox (a one-time
+  flatten, minutes on a large image). Nothing in a sandbox is lost — the vz
+  rootfs is per-boot disposable by design — but the superseded 8 GiB disks sit
+  in the image cache until `clawk image gc`.
+
+- **Toolchain dependency caches are no longer shared with the host.** The Go
+  module cache and Cargo registry were mounted from a host directory; both
+  rely on file locking and atomic-rename semantics that 9p-over-vsock does not
+  honour reliably, which surfaced as checksum-mismatch module failures,
+  EACCES, stalled locks, and half-written cache entries. They now live on the
+  per-VM rootfs: a new sandbox re-downloads its module set (hence the larger
+  default disk above), which is cheaper than debugging a corrupt cache. The
+  mounts return once the 9p transport is hardened.
 
 - **The worktree rides in on its own disk instead of being copied into the
   rootfs.** Staging it used to loop-mount the rootfs as root — six privileged
@@ -94,6 +149,29 @@ tagged.
   agent's login shells silently skipped it and the variables never arrived.
   It is now `0644`, matching the working OAuth-token export
   (clawkwork/clawk#4).
+- **A sandbox authenticated by seeded credentials no longer re-runs onboarding
+  on every boot.** `~/.claude.json` lives on the per-boot disposable rootfs,
+  so the marker clawk-init writes is the whole file claude reads at startup —
+  and it carried `hasCompletedOnboarding` only when a long-lived OAuth token
+  was configured, on the premise that the keychain-credentials path ships its
+  own account metadata. It doesn't, and claude's first-run wizard gates on
+  that flag alone, so a sandbox with a valid `.credentials.json` asked the
+  agent to log in every time. The flag now keys on whether the sandbox boots
+  with usable credentials at all: a token, or a `.credentials.json` already in
+  the state dir. ([#8](https://github.com/clawkwork/clawk/issues/8))
+- **`files ( … )` entries now actually land in the guest.** The in-guest
+  `install` ran as `-o agent -g agent`, but the guest `agent` user has no
+  group of that name — its gid mirrors the host's, where gid 20 is `dialout`
+  on macOS — so `install` failed with `invalid group 'agent'` and the file was
+  never written. Only a non-fatal warning was logged, so `clawk up` reported
+  success while a pushed `~/.netrc` or `~/.kube/config` silently wasn't there.
+  The group is resolved at runtime now.
+- **A bare `allow 10.0.0.0/8` in `clawk.mod` is an error instead of a silent
+  no-op.** It parsed the CIDR as a *domain*, which only ever matches at DNS
+  resolution, so a raw connect to an address in that range was refused despite
+  the rule appearing to permit it. Bare `allow`/`deny` entries that are really
+  an IP or CIDR now fail with a pointer to `allow ip <addr>`, matching what
+  `clawk network allow` already enforced.
 
 ## v0.2.0
 

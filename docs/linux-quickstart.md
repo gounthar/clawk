@@ -165,6 +165,9 @@ The egress allow-list is enforced in gvproxy on the host, so the guest cannot
 turn it off from the inside — that holds in rootless mode too (verified: a
 blocked host is refused and logged, `acl: denied example.com`).
 
+Reverse forwards (`clawk forward add-reverse`) are vz-only: they tunnel over
+a host-side vsock listener, and firecracker's vsock only runs the other way.
+
 ---
 
 ## 5. Limits
