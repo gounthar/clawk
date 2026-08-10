@@ -98,29 +98,25 @@ jobs:
       # df brackets the run because disk exhaustion is the leading suspect:
       # compactext4 writes 16, 32 and 64 GiB sparse images, and a macos runner
       # that does not produce real holes would fill up rather than deadlock.
-      - name: machine module — vet / test
+      # Bounded with timeout-minutes rather than timeout(1): macos does not
+      # ship the GNU coreutils binary, and the previous attempt to use it exited
+      # 127 immediately, so vet never ran and nothing was learned. This is a
+      # platform feature, needs no binary, and — the part that matters — a step
+      # that GitHub cuts short still publishes its log, whereas the job-level
+      # kill we have been hitting retains nothing.
+      - name: machine module — vet (bounded)
         working-directory: machine
+        timeout-minutes: 8
         run: |
-          echo "=== disk before ==="; df -h /
-          echo "=== nproc / mem ==="; sysctl -n hw.ncpu hw.memsize || true
+          echo "=== disk ==="; df -h /
+          echo "=== cpu/mem ==="; sysctl -n hw.ncpu; sysctl -n hw.memsize
+          # -x prints each action as it runs, so the log's last line is the
+          # package vet reached before stopping.
+          time go vet -x ./... 2>&1 | tail -60
 
-          # go vet is the half that has never been instrumented, and the
-          # evidence now points at it: the previous run left go test bounded at
-          # 3m and the timeout never fired in 32 minutes, so the stall is
-          # upstream of the tests. -x prints each action as it runs, so the log
-          # shows the last package vet got to before it stopped. timeout(1)
-          # bounds it, because Go has no equivalent flag for vet and an
-          # unbounded hang costs ~50 minutes of runner and yields no log.
-          echo "=== vet ==="
-          time timeout 300 go vet -x ./... 2>&1 | tail -40
-          vet_status=${PIPESTATUS[0]}
-          echo "vet exit=$vet_status (124 = timed out)"
-          echo "=== disk after vet ==="; df -h /
-          if [ "$vet_status" -ne 0 ]; then exit "$vet_status"; fi
-
-          echo "=== test ==="
-          time go test -v -timeout 3m ./... || {
-            status=$?
-            echo "=== disk after test ==="; df -h /
-            exit $status
-          }
+      - name: machine module — test (bounded)
+        working-directory: machine
+        timeout-minutes: 10
+        run: |
+          time go test -v -timeout 4m ./...
+          echo "=== disk after ==="; df -h /
