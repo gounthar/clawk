@@ -81,42 +81,24 @@ jobs:
           go vet ./...
           go test ./...
 
-      # TEMPORARY — diagnostic, revert before merge.
+      # -p 1 runs one package's tests at a time. Without it this step does not
+      # fail — the runner is lost. The job dies at a consistent 52-53 minutes
+      # with the step still marked in progress, no conclusion, and no uploaded
+      # log; step-level timeout-minutes never fires and neither does Go's own
+      # -timeout, which is what a dead agent looks like rather than a deadlock.
       #
-      # This step hangs on macos for this branch (3 for 3) while passing on
-      # both main and this branch before the merge. An earlier attempt added
-      # -v, -p 1 and -timeout together and passed in 13s, which proved nothing:
-      # -p 1 removed the hang, so the timeout never fired and produced no dump.
+      # A macos-14 runner has 3 cores, ~7 GB of RAM and had 38 GiB free here,
+      # while compactext4 builds 16, 32 and 64 GiB images. Serialised they are
+      # sparse and take 3s; run concurrently with other packages the runner
+      # stops coming back. Bisected by splitting vet from test: vet completes
+      # in 4s, so the whole cost is in the concurrent test phase.
       #
-      # So this changes exactly one thing from the configuration that hangs.
-      # Package parallelism stays at the default, which is the condition that
-      # reproduces it; -timeout 3m converts the hang into a panic carrying a
-      # goroutine dump that names the blocked test and shows what the other
-      # packages were doing at the time. -v records how far each package got
-      # before the stall.
-      #
-      # df brackets the run because disk exhaustion is the leading suspect:
-      # compactext4 writes 16, 32 and 64 GiB sparse images, and a macos runner
-      # that does not produce real holes would fill up rather than deadlock.
-      # Bounded with timeout-minutes rather than timeout(1): macos does not
-      # ship the GNU coreutils binary, and the previous attempt to use it exited
-      # 127 immediately, so vet never ran and nothing was learned. This is a
-      # platform feature, needs no binary, and — the part that matters — a step
-      # that GitHub cuts short still publishes its log, whereas the job-level
-      # kill we have been hitting retains nothing.
-      - name: machine module — vet (bounded)
+      # The bound is cheap — 13s serialised against 10s parallel — so this is
+      # not a workaround with a running cost. -timeout 10m is hygiene: any
+      # future stall inside a single test now fails loudly with a goroutine
+      # dump instead of taking the runner down with it.
+      - name: machine module — vet / test
         working-directory: machine
-        timeout-minutes: 8
         run: |
-          echo "=== disk ==="; df -h /
-          echo "=== cpu/mem ==="; sysctl -n hw.ncpu; sysctl -n hw.memsize
-          # -x prints each action as it runs, so the log's last line is the
-          # package vet reached before stopping.
-          time go vet -x ./... 2>&1 | tail -60
-
-      - name: machine module — test (bounded)
-        working-directory: machine
-        timeout-minutes: 10
-        run: |
-          time go test -v -timeout 4m ./...
-          echo "=== disk after ==="; df -h /
+          go vet ./...
+          go test -p 1 -timeout 10m ./...
