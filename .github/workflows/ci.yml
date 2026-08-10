@@ -81,8 +81,30 @@ jobs:
           go vet ./...
           go test ./...
 
+      # TEMPORARY — diagnostic, revert before merge.
+      #
+      # This step hangs on macos for this branch (3 for 3) while passing on
+      # both main and this branch before the merge. An earlier attempt added
+      # -v, -p 1 and -timeout together and passed in 13s, which proved nothing:
+      # -p 1 removed the hang, so the timeout never fired and produced no dump.
+      #
+      # So this changes exactly one thing from the configuration that hangs.
+      # Package parallelism stays at the default, which is the condition that
+      # reproduces it; -timeout 3m converts the hang into a panic carrying a
+      # goroutine dump that names the blocked test and shows what the other
+      # packages were doing at the time. -v records how far each package got
+      # before the stall.
+      #
+      # df brackets the run because disk exhaustion is the leading suspect:
+      # compactext4 writes 16, 32 and 64 GiB sparse images, and a macos runner
+      # that does not produce real holes would fill up rather than deadlock.
       - name: machine module — vet / test
         working-directory: machine
         run: |
+          echo "=== disk before ==="; df -h /
           go vet ./...
-          go test ./...
+          go test -v -timeout 3m ./... || {
+            status=$?
+            echo "=== disk after ==="; df -h /
+            exit $status
+          }
