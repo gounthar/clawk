@@ -53,8 +53,9 @@ func registerSafeFlag(cmd *cobra.Command) {
 	cmd.Flags().BoolVar(&runSafe, "safe", false,
 		"attach the runner without its permission-bypass default args "+
 			"(claude's --dangerously-skip-permissions, codex's "+
-			"--dangerously-bypass-approvals-and-sandbox), so the agent asks "+
-			"for confirmation as it would on the host")
+			"--dangerously-bypass-approvals-and-sandbox, pi's --approve, "+
+			"opencode's --auto), so the agent asks for confirmation as it "+
+			"would on the host")
 }
 
 // applySafeMode drops a runner's permission-bypass DefaultArgs when --safe is
@@ -239,6 +240,12 @@ func resolveSource(source, profile string) (*template.Workspace, error) {
 		}
 		if ws, err := template.LoadStandaloneClawkfileWithProfile(cwd, profile); err == nil {
 			return ws, nil
+		} else if errors.Is(err, template.ErrGlobalMod) {
+			// The repo's own file may well be absent — but the host-wide layer
+			// being broken is not a reason to try the next shape, it's the
+			// answer. Without this the rung below swallows it and the user gets
+			// "no clawk.mod found, and X is not a git repo".
+			return nil, err
 		}
 		// Last resort: cwd is itself a git repo. Treat it as a single-repo
 		// workspace inheriting only defaults — keeps `clawk work <branch>`
@@ -248,11 +255,22 @@ func resolveSource(source, profile string) (*template.Workspace, error) {
 			return nil, fmt.Errorf(
 				"--profile requires a clawk.mod (none found in %s)", cwd)
 		}
-		if ws, err := template.WorkspaceFromGitRepo(cwd); err == nil {
-			fmt.Fprintf(os.Stderr,
-				"note: no clawk.mod in %s; using defaults "+
-					"(no forwards, no setup). Add clawk.mod to declare them.\n",
-				ws.Root)
+		ws, gerr := template.WorkspaceFromGitRepo(cwd)
+		if errors.Is(gerr, template.ErrGlobalMod) {
+			return nil, gerr
+		}
+		if gerr == nil {
+			if ws.GlobalPath != "" {
+				fmt.Fprintf(os.Stderr,
+					"note: no clawk.mod in %s; using the host-wide defaults in %s. "+
+						"Add clawk.mod to declare repo-specific settings.\n",
+					ws.Root, ws.GlobalPath)
+			} else {
+				fmt.Fprintf(os.Stderr,
+					"note: no clawk.mod in %s; using defaults "+
+						"(no forwards, no setup). Add clawk.mod to declare them.\n",
+					ws.Root)
+			}
 			return ws, nil
 		}
 		return nil, fmt.Errorf(
@@ -354,6 +372,14 @@ func loadOrCreateSandboxFromWorkspace(name string, ws *template.Workspace) (*con
 	if err != nil {
 		return nil, err
 	}
+	serials, err := mergeSerials(ws)
+	if err != nil {
+		return nil, err
+	}
+	mcpServers, err := mergeMCP(ws)
+	if err != nil {
+		return nil, err
+	}
 
 	// Nested virt: workspace-level `nested` directive OR any repo's
 	// Clawkfile requesting it turns it on for the whole sandbox. This
@@ -398,11 +424,14 @@ func loadOrCreateSandboxFromWorkspace(name string, ws *template.Workspace) (*con
 		ReverseForwards: reverseForwards,
 		Files:           files,
 		Shares:          shares,
+		Serials:         serials,
+		MCP:             mcpServers,
 		NestedVirt:      nested,
 		CPU:             cpu,
 		MemoryMiB:       memoryMiB,
 		MemoryMaxMiB:    memoryMaxMiB,
 		DiskMiB:         disk,
+		SwapMiB:         resolveSwap(ws),
 		IdleTimeoutSec:  resolveIdleTimeout(ws),
 		Image:           image,
 		Kernel:          kernel,
@@ -418,6 +447,14 @@ func loadOrCreateSandboxFromWorkspace(name string, ws *template.Workspace) (*con
 	if err := applyNamespaceDefaults(sb); err != nil {
 		return nil, err
 	}
+	// After the namespace, so its entries stay narrower than the workspace's.
+	if err := applyWorkspaceLevelDefaults(sb, ws); err != nil {
+		return nil, err
+	}
+	// After the namespace has folded its own servers in, so the derived
+	// allow layer covers the full set. Before the first Save, so the very
+	// first boot already has the egress its servers need.
+	applyMCPNetwork(sb)
 	if err := store.Save(sb); err != nil {
 		return nil, err
 	}
@@ -427,7 +464,39 @@ func loadOrCreateSandboxFromWorkspace(name string, ws *template.Workspace) (*con
 	} else {
 		fmt.Printf("Created sandbox %q (provider: %s)\n", sb.DisplayName(), sb.Provider)
 	}
+	if ws.GlobalPath != "" {
+		// Named at create because the layer is host-local: it explains config
+		// nobody can find by reading the repo. --no-global excludes it.
+		fmt.Printf("  host-wide defaults from %s\n", ws.GlobalPath)
+	}
 	return sb, nil
+}
+
+// applyWorkspaceLevelDefaults folds the workspace-position `env ( … )` and
+// `agent ( … )` blocks into the record — the workspace file's own, plus the
+// host-wide clawk.mod folded underneath it (see template/global.go).
+//
+// Both were previously dropped on the floor: only repo Clawkfiles fed
+// RequiredEnv and the agent docs (see addPhases), so a workspace root
+// declaring `env ( GITHUB_TOKEN )` silently got nothing. Ordering is
+// scope-outward — workspace, then namespace, then repo — which for env is what
+// decides precedence, since both the profile.d exports and exec's environment
+// let the LAST occurrence of a name win.
+func applyWorkspaceLevelDefaults(sb *config.Sandbox, ws *template.Workspace) error {
+	if len(ws.File.Env) > 0 {
+		sb.RequiredEnv = unionStrings(ws.File.Env, sb.RequiredEnv)
+	}
+	instr, err := resolveAgentDocs(ws.Root, ws.File.Instructions)
+	if err != nil {
+		return fmt.Errorf("workspace agent instructions: %w", err)
+	}
+	sb.Instructions = append(instr, sb.Instructions...)
+	mem, err := resolveAgentDocs(ws.Root, ws.File.Memory)
+	if err != nil {
+		return fmt.Errorf("workspace agent memory: %w", err)
+	}
+	sb.Memory = joinMemory(joinMemory(mem...), sb.Memory)
+	return nil
 }
 
 // resolveProvider picks the provider for a new sandbox, erroring on
@@ -466,7 +535,7 @@ func resolveProvider(ws *template.Workspace) (config.Provider, error) {
 
 // defaultImage is the rootfs new sandboxes boot when neither --image
 // nor clawk.mod chooses one: clawk-dev — our own image bundling a
-// development toolchain (Go/Node/Rust/etc. + claude/codex), built
+// development toolchain (Go/Node/Rust/etc. + claude/codex/pi/opencode), built
 // and published by .github/workflows/publish-clawk-dev.yml. Override
 // per invocation with --image, or per repo/workspace with
 // `vm ( image ... )`.

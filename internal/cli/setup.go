@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/clawkwork/clawk/internal/template"
 	"github.com/spf13/cobra"
 )
 
@@ -133,6 +134,9 @@ func buildPrereqChecks(root string) []prereqCheck {
 // have been parsed."
 func init() {
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
+		// --no-global has to land before the first template load, and every
+		// load happens inside a command's RunE.
+		template.GlobalDisabled = noGlobalFlag
 		// Walk up the command tree to the top-level child of root
 		// (e.g. `clawk image build` → "image"). The skip list is
 		// keyed on the top-level verb because that's the granularity

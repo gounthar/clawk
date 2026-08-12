@@ -38,6 +38,12 @@ type Namespace struct {
 	Files  []HostFile  `json:"files,omitempty"`
 	Shares []HostShare `json:"shares,omitempty"`
 	Env    []string    `json:"env,omitempty"`
+	// MCP are MCP servers made available to every sandbox in the namespace.
+	// This is the natural place for the org-wide set: which namespace a
+	// sandbox lives in then decides what it can reach, with no per-sandbox
+	// configuration. Merged with a repo's clawk.mod entries by name in
+	// applyNamespaceDefaults. See MCPServer.
+	MCP []MCPServer `json:"mcp,omitempty"`
 	// Instructions and Memory seed every sandbox in the namespace: extra
 	// CLAUDE.md guidance and baseline auto-memory respectively. They merge
 	// with a repo's clawk.mod equivalents — namespace first, as the broader

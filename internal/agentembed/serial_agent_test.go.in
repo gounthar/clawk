@@ -1,0 +1,512 @@
+// Tests for the guest agent's serial forwarder, compiled and run inside a
+// throwaway module built from main.go.in — see TestSerialForwarderRuns in
+// the parent repo for how they get here.
+//
+// The agent can't be imported (it is package main in its own module), and
+// its serial half is a state machine with genuinely tricky edges: the
+// primed-hangup trick that makes "is a client attached?" answerable, the
+// attachment lifetime that drives the host's open and close of the real
+// port, and reading back a line configuration the kernel never announces.
+// Compiling it proves none of that. Running it does.
+
+//go:build linux
+
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"io"
+	"log"
+	"net"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+// fakeHost is the other end of the vsock the agent normally dials: it
+// accepts attachments and records what arrives.
+type fakeHost struct {
+	t  *testing.T
+	ln net.Listener
+
+	greetings chan serialGreeting
+	frames    chan hostFrame
+	conns     chan net.Conn
+	refuse    bool
+}
+
+type hostFrame struct {
+	typ     byte
+	payload []byte
+}
+
+func newFakeHost(t *testing.T) *fakeHost {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	h := &fakeHost{
+		t:         t,
+		ln:        ln,
+		greetings: make(chan serialGreeting, 16),
+		frames:    make(chan hostFrame, 256),
+		conns:     make(chan net.Conn, 16),
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	// Point the agent's dialer at us.
+	prev := serialDialHost
+	serialDialHost = func() (net.Conn, error) { return net.Dial("tcp", ln.Addr().String()) }
+	t.Cleanup(func() { serialDialHost = prev })
+
+	go h.accept()
+	return h
+}
+
+func (h *fakeHost) accept() {
+	for {
+		conn, err := h.ln.Accept()
+		if err != nil {
+			return
+		}
+		go h.serve(conn)
+	}
+}
+
+func (h *fakeHost) serve(conn net.Conn) {
+	r := bufio.NewReaderSize(conn, serialMaxLine)
+	var g serialGreeting
+	if err := serialReadLine(r, &g); err != nil {
+		return
+	}
+	h.greetings <- g
+	if g.Op != "attach" {
+		return
+	}
+	if h.refuse {
+		_ = serialWriteLine(conn, serialAttachReply{OK: false, Error: "board unplugged"})
+		_ = conn.Close()
+		return
+	}
+	if err := serialWriteLine(conn, serialAttachReply{OK: true}); err != nil {
+		return
+	}
+	h.conns <- conn
+	for {
+		typ, payload, err := serialReadFrame(r)
+		if err != nil {
+			return
+		}
+		h.frames <- hostFrame{typ: typ, payload: payload}
+	}
+}
+
+func (h *fakeHost) waitGreeting(timeout time.Duration) (serialGreeting, bool) {
+	select {
+	case g := <-h.greetings:
+		return g, true
+	case <-time.After(timeout):
+		return serialGreeting{}, false
+	}
+}
+
+func (h *fakeHost) waitFrame(typ byte, timeout time.Duration) (hostFrame, bool) {
+	deadline := time.After(timeout)
+	for {
+		select {
+		case f := <-h.frames:
+			if f.typ == typ {
+				return f, true
+			}
+		case <-deadline:
+			return hostFrame{}, false
+		}
+	}
+}
+
+// startDevice brings up one forwarded device rooted in a temp dir, so the
+// symlink lands somewhere writable without root.
+func startDevice(t *testing.T, name string) *serialDevice {
+	t.Helper()
+	dir := t.TempDir()
+	prev := serialDevDir
+	serialDevDir = dir
+	t.Cleanup(func() { serialDevDir = prev })
+
+	dev, err := newSerialDevice(log.New(io.Discard, "", 0), name)
+	if err != nil {
+		t.Fatalf("newSerialDevice: %v", err)
+	}
+	t.Cleanup(dev.stop)
+	go dev.run()
+	return dev
+}
+
+// openClient opens the device the way a tool in the sandbox would: through
+// the published name, not the PTY path.
+func openClient(t *testing.T, dev *serialDevice) *os.File {
+	t.Helper()
+	f, err := os.OpenFile(filepath.Join(serialDevDir, dev.name), os.O_RDWR|unix.O_NOCTTY, 0)
+	if err != nil {
+		t.Fatalf("opening client end: %v", err)
+	}
+	return f
+}
+
+func setClientBaud(t *testing.T, f *os.File, cbaud uint32) {
+	t.Helper()
+	tio, err := unix.IoctlGetTermios(int(f.Fd()), unix.TCGETS)
+	if err != nil {
+		t.Fatalf("TCGETS: %v", err)
+	}
+	tio.Cflag = (tio.Cflag &^ unix.CBAUD) | cbaud
+	if err := unix.IoctlSetTermios(int(f.Fd()), unix.TCSETS, tio); err != nil {
+		t.Fatalf("TCSETS: %v", err)
+	}
+}
+
+// The device node has to exist as soon as the host publishes it, whether or
+// not anything ever opens it.
+func TestSerialDevicePublishesNode(t *testing.T) {
+	newFakeHost(t)
+	dev := startDevice(t, "ttyTEST0")
+
+	link := filepath.Join(serialDevDir, "ttyTEST0")
+	target, err := os.Readlink(link)
+	if err != nil {
+		t.Fatalf("device node not published: %v", err)
+	}
+	if target != dev.slavePath {
+		t.Fatalf("node points at %q, want %q", target, dev.slavePath)
+	}
+}
+
+// Nothing has the device open, so nothing should be holding the physical
+// port on the host. This is the primed-hangup trick working: without it the
+// loop cannot tell "never opened" from "open and idle" and attaches to a
+// board nobody asked for.
+func TestSerialNoAttachUntilClientOpens(t *testing.T) {
+	host := newFakeHost(t)
+	startDevice(t, "ttyTEST0")
+
+	if g, ok := host.waitGreeting(500 * time.Millisecond); ok {
+		t.Fatalf("attached with no client holding the device: %+v", g)
+	}
+}
+
+// Opening the device is what makes the host open the real port — the event
+// an Arduino sees as its reset pulse.
+func TestSerialAttachOnClientOpen(t *testing.T) {
+	host := newFakeHost(t)
+	dev := startDevice(t, "ttyTEST0")
+
+	client := openClient(t, dev)
+	defer client.Close()
+
+	g, ok := host.waitGreeting(5 * time.Second)
+	if !ok {
+		t.Fatal("no attach after the client opened the device")
+	}
+	if g.Op != "attach" || g.Name != "ttyTEST0" {
+		t.Fatalf("unexpected greeting: %+v", g)
+	}
+	if g.Mode == nil {
+		t.Fatal("attach greeting carried no mode; the host would open at a guessed baud")
+	}
+}
+
+// Closing the device must drop the attachment, which is what makes the host
+// release the port — both so the reset pulse has a falling edge and so the
+// Mac's own tooling can have the board back.
+func TestSerialDetachOnClientClose(t *testing.T) {
+	host := newFakeHost(t)
+	dev := startDevice(t, "ttyTEST0")
+
+	client := openClient(t, dev)
+	if _, ok := host.waitGreeting(5 * time.Second); !ok {
+		t.Fatal("no attach")
+	}
+	conn := <-host.conns
+	_ = client.Close()
+
+	// The host sees the attachment end as its connection closing.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("attachment outlived the client that opened the device")
+	}
+}
+
+// Close then reopen is every upload to a native-USB board: the client drops
+// the port, the board reboots into its bootloader, the client comes back.
+// The host has to see a matching close and reopen of the physical port, or
+// the board never gets its reset — so this asserts the detach lands
+// *between* the two attaches rather than just that a second one happens.
+func TestSerialReattachAfterClientReopens(t *testing.T) {
+	host := newFakeHost(t)
+	dev := startDevice(t, "ttyTEST0")
+
+	client := openClient(t, dev)
+	if _, ok := host.waitGreeting(5 * time.Second); !ok {
+		t.Fatal("no first attach")
+	}
+	conn := <-host.conns
+	_ = client.Close()
+
+	// Wait for the host to observe the detach before reopening. Any real
+	// close/reopen has a gap — the board is re-enumerating on the USB bus —
+	// and closing and reopening with no gap at all would be asking the
+	// agent to notice a state the kernel never held long enough to report.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("attachment outlived the client")
+	}
+
+	client2 := openClient(t, dev)
+	defer client2.Close()
+	if _, ok := host.waitGreeting(5 * time.Second); !ok {
+		t.Fatal("device never reattached after the client reopened it")
+	}
+}
+
+func TestSerialForwardsBytesToHost(t *testing.T) {
+	host := newFakeHost(t)
+	dev := startDevice(t, "ttyTEST0")
+
+	client := openClient(t, dev)
+	defer client.Close()
+	if _, ok := host.waitGreeting(5 * time.Second); !ok {
+		t.Fatal("no attach")
+	}
+
+	if _, err := client.Write([]byte("hello board")); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	f, ok := host.waitFrame(serialFrameData, 5*time.Second)
+	if !ok {
+		t.Fatal("client output never reached the host")
+	}
+	if string(f.payload) != "hello board" {
+		t.Fatalf("host got %q", f.payload)
+	}
+}
+
+func TestSerialForwardsBytesToClient(t *testing.T) {
+	host := newFakeHost(t)
+	dev := startDevice(t, "ttyTEST0")
+
+	client := openClient(t, dev)
+	defer client.Close()
+	if _, ok := host.waitGreeting(5 * time.Second); !ok {
+		t.Fatal("no attach")
+	}
+	conn := <-host.conns
+
+	if err := serialWriteFrame(conn, serialFrameData, []byte("hello guest")); err != nil {
+		t.Fatalf("host write: %v", err)
+	}
+
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 64)
+	n, err := client.Read(buf)
+	if err != nil {
+		t.Fatalf("client read: %v", err)
+	}
+	if string(buf[:n]) != "hello guest" {
+		t.Fatalf("client got %q", buf[:n])
+	}
+}
+
+// A baud change produces no event of any kind on a PTY — the loop has to
+// notice it by looking. This is the mechanism the 1200-baud touch rides on,
+// so it gets its own test.
+func TestSerialReportsBaudChange(t *testing.T) {
+	host := newFakeHost(t)
+	dev := startDevice(t, "ttyTEST0")
+
+	client := openClient(t, dev)
+	defer client.Close()
+	if _, ok := host.waitGreeting(5 * time.Second); !ok {
+		t.Fatal("no attach")
+	}
+
+	setClientBaud(t, client, unix.B115200)
+
+	f, ok := host.waitFrame(serialFrameMode, 5*time.Second)
+	if !ok {
+		t.Fatal("baud change never reached the host")
+	}
+	var mode serialMode
+	if err := json.Unmarshal(f.payload, &mode); err != nil {
+		t.Fatalf("bad mode frame: %v", err)
+	}
+	if mode.Baud != 115200 {
+		t.Fatalf("host told %d baud, want 115200", mode.Baud)
+	}
+}
+
+// The 1200-baud touch in full: set 1200, then close immediately. The mode
+// has to reach the host before the detach, or the board never enters its
+// bootloader and every upload to a Leonardo or ESP32-S3 fails.
+func TestSerial1200BaudTouchReachesHostBeforeDetach(t *testing.T) {
+	host := newFakeHost(t)
+	dev := startDevice(t, "ttyTEST0")
+
+	client := openClient(t, dev)
+	if _, ok := host.waitGreeting(5 * time.Second); !ok {
+		t.Fatal("no attach")
+	}
+
+	setClientBaud(t, client, unix.B1200)
+	_ = client.Close()
+
+	f, ok := host.waitFrame(serialFrameMode, 5*time.Second)
+	if !ok {
+		t.Fatal("the 1200-baud touch was lost when the client closed")
+	}
+	var mode serialMode
+	if err := json.Unmarshal(f.payload, &mode); err != nil {
+		t.Fatalf("bad mode frame: %v", err)
+	}
+	if mode.Baud != 1200 {
+		t.Fatalf("host told %d baud, want 1200", mode.Baud)
+	}
+}
+
+// An unchanged configuration must not produce a frame every time the loop
+// looks — that would be 10 pointless wakeups a second on the host for as
+// long as a monitor is open.
+func TestSerialDoesNotRepeatUnchangedMode(t *testing.T) {
+	host := newFakeHost(t)
+	dev := startDevice(t, "ttyTEST0")
+
+	client := openClient(t, dev)
+	defer client.Close()
+	if _, ok := host.waitGreeting(5 * time.Second); !ok {
+		t.Fatal("no attach")
+	}
+
+	if _, ok := host.waitFrame(serialFrameMode, 700*time.Millisecond); ok {
+		t.Fatal("resent an unchanged mode")
+	}
+}
+
+// A refused attach — an unplugged board, or one the Mac's own tooling holds
+// — must not spin. The client keeps the device open, so the agent keeps
+// trying, but at a pace that doesn't burn a core.
+func TestSerialRefusedAttachRetriesWithoutSpinning(t *testing.T) {
+	host := newFakeHost(t)
+	host.refuse = true
+	dev := startDevice(t, "ttyTEST0")
+
+	client := openClient(t, dev)
+	defer client.Close()
+
+	if _, ok := host.waitGreeting(5 * time.Second); !ok {
+		t.Fatal("never tried to attach")
+	}
+	// Second attempt should come after the retry interval, not immediately.
+	start := time.Now()
+	if _, ok := host.waitGreeting(5 * time.Second); !ok {
+		t.Fatal("gave up after one refusal while the client still held the device")
+	}
+	if elapsed := time.Since(start); elapsed < serialAttachRetryInterval/2 {
+		t.Fatalf("retried after %v; that is a spin, not a retry", elapsed)
+	}
+}
+
+// Removing a device from the published set has to take the node with it. A
+// leftover /dev entry would accept an open and then sit mute, which reads
+// as broken hardware rather than an absent forward.
+func TestSerialStopRemovesNode(t *testing.T) {
+	newFakeHost(t)
+	dev := startDevice(t, "ttyTEST0")
+	link := filepath.Join(serialDevDir, "ttyTEST0")
+
+	if _, err := os.Readlink(link); err != nil {
+		t.Fatalf("node was never published: %v", err)
+	}
+	dev.stop()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Readlink(link); err != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("device node outlived the device")
+}
+
+// The name arrives over the wire and becomes a path, so the guest validates
+// it again rather than trusting the host to have done so.
+func TestSerialApplyRejectsUnsafeNames(t *testing.T) {
+	newFakeHost(t)
+	dir := t.TempDir()
+	prev := serialDevDir
+	serialDevDir = dir
+	t.Cleanup(func() { serialDevDir = prev })
+
+	f := &serialForwarder{log: log.New(io.Discard, "", 0), devices: map[string]*serialDevice{}}
+	f.apply([]serialDeviceMsg{
+		{Name: "../escape"},
+		{Name: "sub/dir"},
+		{Name: ""},
+		{Name: ".hidden"},
+	})
+	t.Cleanup(func() { f.apply(nil) })
+
+	if len(f.devices) != 0 {
+		t.Fatalf("created %d device(s) from unsafe names", len(f.devices))
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("unsafe names left %d entries behind", len(entries))
+	}
+}
+
+// A writer can be gone before the loop ever sees it open. `echo cmd >
+// /dev/ttyACM0`, and every script that does printf into a device, opens,
+// writes and closes in microseconds — far inside serialPollInterval — so the
+// loop's first sight of it is POLLIN and POLLHUP together. The two flags are
+// independent (input_available_p vs TTY_OTHER_CLOSED), and honouring the
+// hangup first discarded the bytes with no error on either side.
+func TestSerialShortLivedWriterIsNotLost(t *testing.T) {
+	host := newFakeHost(t)
+	dev := startDevice(t, "ttyTEST0")
+
+	// Let the loop settle into its detached backoff first, so the whole
+	// open-write-close below lands between two polls. Catching the client
+	// while it still holds the device would exercise the ordinary attached
+	// path and prove nothing about this one.
+	time.Sleep(150 * time.Millisecond)
+
+	client := openClient(t, dev)
+	if _, err := client.Write([]byte("reset\r\n")); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	_ = client.Close()
+
+	f, ok := host.waitFrame(serialFrameData, 5*time.Second)
+	if !ok {
+		t.Fatal("a write followed immediately by close never reached the host")
+	}
+	if string(f.payload) != "reset\r\n" {
+		t.Fatalf("host got %q, want %q", f.payload, "reset\r\n")
+	}
+
+	// And the flush must not leave the port held: the host closes the
+	// physical device when the attachment goes, so a drain that forgot to
+	// let go would keep the board away from the Mac indefinitely.
+	if _, ok := host.waitGreeting(time.Second); !ok {
+		t.Fatal("no attach greeting for the flush")
+	}
+}

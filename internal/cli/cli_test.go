@@ -60,6 +60,7 @@ func setupTest(t *testing.T) (*config.Store, *sandbox.MockProvider) {
 		statusJSON = false
 		statusBrief = false
 		forwardListJSON = false
+		serialListJSON = false
 		networkListJSON = false
 		worktreeListJSON = false
 		imageFlag = ""

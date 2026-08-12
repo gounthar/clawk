@@ -101,7 +101,7 @@ func TestToolchainCacheSharesUniqueTags(t *testing.T) {
 	stateRoot := t.TempDir()
 
 	all := append([]HostShare{}, DefaultHostShares()...)
-	all = append(all, PersistentClaudeShares(stateRoot)...)
+	all = append(all, PersistentAgentShares(stateRoot)...)
 	all = append(all, ToolchainCacheShares(cacheDir)...)
 
 	seen := make(map[string]string, len(all))
@@ -205,6 +205,62 @@ func TestEnvFileComposeModel(t *testing.T) {
 		if !strings.Contains(content, want) {
 			t.Errorf("missing line %q in:\n%s", want, content)
 		}
+	}
+}
+
+// TestResolveEnvSharedByBothDeliveryPaths pins the contract EnvFile and the
+// vsock handshake share: canonical NAME=value strings in declaration order,
+// values read from the host env at call time (never persisted).
+func TestResolveEnvSharedByBothDeliveryPaths(t *testing.T) {
+	t.Setenv("HOST_GH", "ghp_xyz")
+	os.Unsetenv("HOST_MISSING")
+
+	got, err := ResolveEnv(&config.Sandbox{
+		Name: "sb",
+		RequiredEnv: []string{
+			"GH_TOKEN=${HOST_GH}",
+			"LOG_LEVEL=${HOST_MISSING:-info}",
+			"EDITOR=vim",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ResolveEnv: %v", err)
+	}
+	want := []string{"GH_TOKEN=ghp_xyz", "LOG_LEVEL=info", "EDITOR=vim"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	if entries, err := ResolveEnv(&config.Sandbox{Name: "sb"}); err != nil || entries != nil {
+		t.Errorf("no declared env: got %v, %v; want nil, nil", entries, err)
+	}
+}
+
+// TestResolveEnvReturnsPartialResults is what lets attach stay best-effort
+// while create stays strict: one unresolvable entry must not take the
+// resolvable ones down with it. EnvFile treats the error as fatal;
+// cli.buildVSockEnv warns and uses what came back.
+func TestResolveEnvReturnsPartialResults(t *testing.T) {
+	os.Unsetenv("HOST_REQUIRED")
+	t.Setenv("HOST_OK", "fine")
+
+	got, err := ResolveEnv(&config.Sandbox{
+		Name: "sb",
+		RequiredEnv: []string{
+			"API_KEY=${HOST_REQUIRED:?set it in your shell}",
+			"OK=${HOST_OK}",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected an error for the required-but-missing entry")
+	}
+	if len(got) != 1 || got[0] != "OK=fine" {
+		t.Errorf("got %v, want the one resolvable entry [OK=fine]", got)
 	}
 }
 

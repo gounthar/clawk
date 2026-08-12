@@ -193,6 +193,14 @@ func namespaceFromDef(def template.NamespaceDef, dryRun bool) (*config.Namespace
 	if err != nil {
 		return nil, err
 	}
+	var mcpSources []mcpSource
+	for _, s := range tmpl.MCP {
+		mcpSources = append(mcpSources, mcpSource{Origin: "manifest", Spec: s})
+	}
+	mcpServers, err := composeMCP(mcpSources)
+	if err != nil {
+		return nil, err
+	}
 
 	denied := make([]string, 0, len(tmpl.DenyDomains))
 	for _, d := range tmpl.DenyDomains {
@@ -217,5 +225,6 @@ func namespaceFromDef(def template.NamespaceDef, dryRun bool) (*config.Namespace
 		Files:          files,
 		Shares:         shares,
 		Env:            dedupStrings(tmpl.Env),
+		MCP:            mcpServers,
 	}, nil
 }

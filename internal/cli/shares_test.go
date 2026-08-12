@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/clawkwork/clawk/internal/config"
@@ -76,4 +78,79 @@ func TestCollectSandboxShares_InPlaceOnly(t *testing.T) {
 	require.NotContains(t, byTag, sandbox.WorkspaceShareTag,
 		"in-place-only sandbox needs no consolidated parent")
 	require.Contains(t, byTag, "here")
+}
+
+// TestCollectSandboxShares_AgentStateDevices pins the host-device side of the
+// per-runner state mounts. Every entry in sandbox.AgentStateDirs must get a
+// virtio-fs device here, or the guest manifest asks clawk-init to mount a tag
+// vz never exposed — the runner then writes to the rootfs, which vz re-clones
+// from the image on every boot, and its history disappears on `clawk up`.
+func TestCollectSandboxShares_AgentStateDevices(t *testing.T) {
+	withTempStore(t)
+
+	sb := &config.Sandbox{Name: "box"}
+	byTag := map[string]machine.Share{}
+	for _, s := range collectSandboxShares(sb) {
+		byTag[s.Tag] = s
+	}
+
+	stateRoot := store.StateDir("box")
+	for _, d := range sandbox.AgentStateDirs {
+		sh, ok := byTag[d.Tag]
+		require.Truef(t, ok, "%s state device (tag %s) missing", d.Agent, d.Tag)
+		require.Equal(t, filepath.Join(stateRoot, d.Sub), sh.HostPath,
+			"%s state must come from the sandbox's host state dir, which survives destroy", d.Agent)
+		require.Falsef(t, sh.ReadOnly, "%s state must be writable", d.Agent)
+	}
+}
+
+// TestCollectSandboxShares_MatchesGuestManifest is the lock-step check the
+// comment on collectSandboxShares demands: the vz device list and the guest
+// mount manifest are built by two separate functions, and a tag in one but
+// not the other is either a mount of a device that doesn't exist or a device
+// nothing ever mounts. Both failures are silent at boot.
+func TestCollectSandboxShares_MatchesGuestManifest(t *testing.T) {
+	withTempStore(t)
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	require.NoError(t, os.MkdirAll(filepath.Join(home, ".claude", "agents"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(home, ".codex", "skills"), 0o755))
+
+	sb := &config.Sandbox{
+		Name:  "box",
+		Image: "golang:1.25",
+		Phases: []config.Phase{
+			{Worktree: filepath.Join(store.WorktreeDir("box"), "proj"), Repo: "/code/proj"},
+			{Worktree: "/code/here", Repo: "/code/here", InPlace: true},
+		},
+		Shares: []config.HostShare{
+			{HostPath: "/Users/u/.aws", GuestPath: sandbox.GuestHome + "/.aws", ReadOnly: true},
+		},
+	}
+
+	deviceTags := map[string]bool{}
+	for _, s := range collectSandboxShares(sb) {
+		deviceTags[s.Tag] = true
+	}
+
+	m, err := sandbox.OCIGuestManifest(sb, store.StateDir("box"), store.CacheDir(), store.RootDir())
+	require.NoError(t, err)
+	mountTags := map[string]bool{}
+	for _, mt := range m.Mounts {
+		if mt.Block != "" {
+			continue // block devices carry no virtio-fs tag
+		}
+		mountTags[mt.Tag] = true
+	}
+
+	for tag := range mountTags {
+		require.Containsf(t, deviceTags, tag,
+			"guest mounts tag %q but no virtio-fs device exposes it", tag)
+	}
+	for tag := range deviceTags {
+		require.Containsf(t, mountTags, tag,
+			"virtio-fs device %q is exposed but the guest never mounts it", tag)
+	}
+	require.Contains(t, mountTags, "codex_home", "test set up no agent state mounts")
 }

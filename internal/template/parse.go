@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"io/fs"
 	"net/netip"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/clawkwork/clawk/internal/config"
 	"github.com/clawkwork/clawk/internal/envspec"
 )
 
@@ -35,6 +37,23 @@ type FileSpec struct {
 	Line, Col int
 }
 
+// SerialSpec is one `serial (...)` entry: a host serial port presented as a
+// device inside the guest.
+//
+//   - HostPath: the device on this machine, e.g. /dev/cu.usbmodem1101. May
+//     be a glob, resolved when the port is opened rather than now.
+//   - GuestName: the bare name the device appears under in the guest's
+//     /dev. Empty defaults to the host device's basename — except for a
+//     glob, which has no basename and must name one explicitly.
+type SerialSpec struct {
+	HostPath  string
+	GuestName string
+
+	// Line/Col record where the entry appeared so duplicate-name conflicts
+	// can be reported back to the right line.
+	Line, Col int
+}
+
 // ShareSpec is one entry in a `shares (...)` block: a host directory
 // live-mounted into the guest via virtio-fs. Edits on the host are
 // visible inside the guest without clawk involvement — the host owns
@@ -47,6 +66,32 @@ type ShareSpec struct {
 	HostPath  string
 	GuestPath string // absolute guest mount point; empty = same as HostPath after tilde expansion
 	ReadOnly  bool   // defaults to true at parse time (see parseSharesBlock)
+	Line, Col int
+}
+
+// MCPSpec is one entry in an `mcp (...)` block: an MCP server the project
+// wants available to the agent inside the sandbox. Written as
+//
+//	<name> <url>                        http transport (the default)
+//	<name> http|sse <url>               explicit remote transport
+//	<name> stdio "<command> <args...>"  a local server process
+//
+// followed by any number of `header "Name: value"` and `env NAME`
+// modifiers on the same line.
+//
+// Credential values never appear here — a `${VAR}` inside a header (or the
+// implied `NAME=${NAME}` of an env entry) is kept verbatim and expanded by
+// the runner inside the guest. See config.MCPServer.
+type MCPSpec struct {
+	Name      string
+	Transport string // config.MCPTransport* value
+	URL       string
+	Command   []string
+	Headers   []string
+	Env       []string
+
+	// Line/Col record where the entry appeared so a conflict between two
+	// repos declaring the same server name is reported at the right line.
 	Line, Col int
 }
 
@@ -129,6 +174,14 @@ type Template struct {
 	// See ShareSpec for semantics.
 	Shares []ShareSpec
 
+	// Serials is the forwarded serial-port list (`serial (...)`).
+	// See SerialSpec for semantics.
+	Serials []SerialSpec
+
+	// MCP is the declared MCP server list (`mcp (...)`).
+	// See MCPSpec for semantics.
+	MCP []MCPSpec
+
 	// Instructions and Memory come from the `agent ( ... )` block: extra
 	// persistent CLAUDE.md guidance and a baseline auto-memory seed. Each is
 	// an ordered list of AgentDocs (inline text or a markdown file) resolved
@@ -164,6 +217,13 @@ type Template struct {
 	// it for repos with big dependency trees now that toolchain caches live
 	// on the rootfs.
 	DiskMiB uint64
+
+	// SwapMiB is the guest swap device's capacity in mebibytes, declared as
+	// `swap <size|off>` inside the `vm ( ... )` block. Zero = unset (the
+	// built-in sandbox.DefaultSwapSizeMiB applies); negative = "off", no swap
+	// device. The device is sparse, so the size bounds how much the guest may
+	// swap rather than reserving anything up front.
+	SwapMiB int64
 
 	// IdleTimeoutSec is the sandbox's idle-stop timeout in seconds: how
 	// long the VM may sit with no attached session and a quiescent guest
@@ -224,6 +284,8 @@ func (t *Template) Merge(over *Template) {
 	t.Skills = mergeSkills(t.Skills, over.Skills)
 	t.Files = append(t.Files, over.Files...)
 	t.Shares = append(t.Shares, over.Shares...)
+	t.Serials = append(t.Serials, over.Serials...)
+	t.MCP = append(t.MCP, over.MCP...)
 	t.Instructions = append(t.Instructions, over.Instructions...)
 	t.Memory = append(t.Memory, over.Memory...)
 	// Bool fields: OR so a profile can only enable, never disable.
@@ -245,9 +307,45 @@ func (t *Template) Merge(over *Template) {
 	if over.DiskMiB != 0 {
 		t.DiskMiB = over.DiskMiB
 	}
+	if over.SwapMiB != 0 {
+		t.SwapMiB = over.SwapMiB
+	}
 	if over.IdleTimeoutSec != 0 {
 		t.IdleTimeoutSec = over.IdleTimeoutSec
 	}
+}
+
+// Clone returns a deep-enough copy of t for Merge to write into without
+// touching the original's backing arrays. Every field is either a scalar or a
+// slice of values, so copying the slices is sufficient — used by the host-wide
+// defaults layer, which is loaded once and merged under several templates.
+func (t *Template) Clone() *Template {
+	if t == nil {
+		return &Template{}
+	}
+	c := *t
+	c.Includes = slices.Clone(t.Includes)
+	c.Domains = slices.Clone(t.Domains)
+	c.IPs = slices.Clone(t.IPs)
+	c.Use = slices.Clone(t.Use)
+	c.DenyDomains = slices.Clone(t.DenyDomains)
+	c.DenyIPs = slices.Clone(t.DenyIPs)
+	c.DenySources = slices.Clone(t.DenySources)
+	c.Forwards = slices.Clone(t.Forwards)
+	c.ReverseForwards = slices.Clone(t.ReverseForwards)
+	c.Env = slices.Clone(t.Env)
+	c.OnCreate = slices.Clone(t.OnCreate)
+	c.OnUp = slices.Clone(t.OnUp)
+	c.OnDown = slices.Clone(t.OnDown)
+	c.OnEnter = slices.Clone(t.OnEnter)
+	c.Skills = slices.Clone(t.Skills)
+	c.Files = slices.Clone(t.Files)
+	c.Shares = slices.Clone(t.Shares)
+	c.Serials = slices.Clone(t.Serials)
+	c.MCP = slices.Clone(t.MCP)
+	c.Instructions = slices.Clone(t.Instructions)
+	c.Memory = slices.Clone(t.Memory)
+	return &c
 }
 
 type parser struct {
@@ -309,6 +407,10 @@ func (p *parser) parseTemplateDirective(tmpl *Template, t Token) error {
 		return p.parseFilesBlock(tmpl)
 	case "shares":
 		return p.parseSharesBlock(tmpl)
+	case "serial":
+		return p.parseSerialBlock(tmpl)
+	case "mcp":
+		return p.parseMCPBlock(tmpl)
 	case "agent":
 		return p.parseAgentBlock(tmpl)
 	case "env":
@@ -336,8 +438,8 @@ func (p *parser) parseTemplateDirective(tmpl *Template, t Token) error {
 		return p.errorAt(t,
 			"unknown directive %q (want %s)", t.Val,
 			describeFirst([]string{
-				"vm", "network", "forwards", "files", "shares",
-				"agent", "skills", "on", "includes", "env",
+				"vm", "network", "forwards", "files", "shares", "serial",
+				"mcp", "agent", "skills", "on", "includes", "env",
 			}))
 	}
 }
@@ -699,6 +801,44 @@ func (p *parser) parseIdleTimeout(tmpl *Template) error {
 	return p.expectNewlineOrEOF()
 }
 
+// parseSwap handles `swap <size|off>` inside the vm block — the capacity of
+// the guest's swap device. Sizes use the same units as `memory` and `disk`;
+// "off" and "0" disable swap entirely (stored as -1, so "explicitly off"
+// stays distinguishable from "unset", exactly as idle_timeout does).
+//
+// A floor of 64 MiB rejects the unit typo `swap 512M` meant as 512 GiB less
+// harshly than it rejects `swap 4` — anything smaller is too little to
+// absorb a balloon inflation and is almost certainly a mistake.
+func (p *parser) parseSwap(tmpl *Template) error {
+	p.advance() // consume "swap"
+	val := p.peek()
+	if val.Kind != TokIdent {
+		return p.errorAt(val, "expected size or 'off' after 'swap', got %s", val)
+	}
+	if tmpl.SwapMiB != 0 {
+		return p.errorAt(val, "duplicate 'swap' directive")
+	}
+	switch val.Val {
+	case "off", "0":
+		tmpl.SwapMiB = -1
+	default:
+		mib, err := parseMiB(val.Val)
+		if err != nil {
+			return p.errorAt(val, "%q: %v", "swap", err)
+		}
+		if mib < minSwapMiB {
+			return p.errorAt(val,
+				"swap %q too small: minimum %d MiB (use 'off' to disable)", val.Val, minSwapMiB)
+		}
+		tmpl.SwapMiB = int64(mib)
+	}
+	p.advance()
+	return p.expectNewlineOrEOF()
+}
+
+// minSwapMiB is the floor for an explicit `vm ( swap <size> )`.
+const minSwapMiB = 64
+
 // parseNested handles the bare `nested` directive. It takes no value —
 // setting Template.Nested true and requiring the line to end immediately
 // keeps the syntax unambiguous and matches how Go's `go 1.x` line works
@@ -751,6 +891,10 @@ func (p *parser) parseVMBlock(tmpl *Template) error {
 			if err := p.parseMemory(&tmpl.DiskMiB, "disk"); err != nil {
 				return err
 			}
+		case "swap":
+			if err := p.parseSwap(tmpl); err != nil {
+				return err
+			}
 		case "nested":
 			if err := p.parseNested(tmpl); err != nil {
 				return err
@@ -771,7 +915,7 @@ func (p *parser) parseVMBlock(tmpl *Template) error {
 			return p.errorAt(t,
 				"unknown 'vm' directive %q (want %s)", t.Val,
 				describeFirst([]string{
-					"provider", "cpu", "memory", "memory_max", "disk", "nested", "idle_timeout", "image", "kernel",
+					"provider", "cpu", "memory", "memory_max", "disk", "swap", "nested", "idle_timeout", "image", "kernel",
 				}))
 		}
 	}
@@ -1064,6 +1208,53 @@ func (p *parser) parseFilesBlock(tmpl *Template) error {
 	}
 }
 
+// parseSerialBlock handles `serial ( <host-device> [<guest-name>] ... )`.
+// Each entry is one or two whitespace-separated tokens on a line:
+//
+//	serial (
+//	    /dev/cu.usbmodem1101              # same name inside the guest
+//	    /dev/cu.usbserial-A50285BI ttyUSB0
+//	    /dev/cu.usbmodem* ttyACM0         # resolved when the port is opened
+//	)
+//
+// Space-separated rather than the CLI's HOST:GUEST spelling, matching
+// `files` and `shares`: these are paths, and a colon inside one would be
+// ambiguous in a way a port number never is.
+//
+// Nothing is validated here beyond the shape — internal/cli turns these
+// into config.SerialDevice and checks the names, the same division of
+// labour as the other resource blocks.
+func (p *parser) parseSerialBlock(tmpl *Template) error {
+	p.advance() // consume "serial"
+	t := p.peek()
+	if t.Kind != TokLParen {
+		return p.errorAt(t, "expected '(' after 'serial', got %s", t)
+	}
+	p.advance()
+	for {
+		p.skipNewlines()
+		t := p.peek()
+		if t.Kind == TokRParen {
+			p.advance()
+			return p.expectNewlineOrEOF()
+		}
+		if t.Kind != TokIdent {
+			return p.errorAt(t, "expected serial device path or ')', got %s", t)
+		}
+		spec := SerialSpec{HostPath: t.Val, Line: t.Line, Col: t.Col}
+		p.advance()
+		if nx := p.peek(); nx.Kind == TokIdent {
+			spec.GuestName = nx.Val
+			p.advance()
+		}
+		if next := p.peek(); next.Kind != TokNewline && next.Kind != TokRParen && next.Kind != TokEOF {
+			return p.errorAt(next,
+				"unexpected token after serial entry; one host device and optional guest name per line")
+		}
+		tmpl.Serials = append(tmpl.Serials, spec)
+	}
+}
+
 // parseSharesBlock handles `shares ( <host> [<guest>] [ro|rw] ... )`.
 // Mount points default to ReadOnly = true: the host owns rotation for
 // the use cases we built this for (`~/.aws`), and an accidental in-VM
@@ -1123,6 +1314,212 @@ func (p *parser) parseSharesBlock(tmpl *Template) error {
 		}
 		tmpl.Shares = append(tmpl.Shares, spec)
 	}
+}
+
+// parseMCPBlock handles `mcp ( <name> [http|sse|stdio] <target> [modifiers] ... )`.
+// See MCPSpec for the accepted line shapes.
+//
+// The transport keyword is optional in the common case: a target that looks
+// like an http(s) URL implies the http transport, which keeps the frequent
+// one-line remote declaration short. stdio always needs its keyword, since a
+// bare command word would otherwise be ambiguous with a server name.
+func (p *parser) parseMCPBlock(tmpl *Template) error {
+	p.advance() // consume "mcp"
+	t := p.peek()
+	if t.Kind != TokLParen {
+		return p.errorAt(t, "expected '(' after 'mcp', got %s", t)
+	}
+	p.advance()
+	for {
+		p.skipNewlines()
+		t := p.peek()
+		if t.Kind == TokRParen {
+			p.advance()
+			return p.expectNewlineOrEOF()
+		}
+		if t.Kind != TokIdent {
+			return p.errorAt(t, "expected MCP server name or ')', got %s", t)
+		}
+		spec := MCPSpec{Name: t.Val, Line: t.Line, Col: t.Col}
+		if err := validateMCPName(spec.Name); err != nil {
+			return p.errorAt(t, "%v", err)
+		}
+		p.advance()
+
+		if err := p.parseMCPTarget(&spec); err != nil {
+			return err
+		}
+		if err := p.parseMCPModifiers(&spec); err != nil {
+			return err
+		}
+		if next := p.peek(); next.Kind != TokNewline && next.Kind != TokRParen && next.Kind != TokEOF {
+			return p.errorAt(next, "unexpected token after mcp entry %q", spec.Name)
+		}
+		tmpl.MCP = append(tmpl.MCP, spec)
+	}
+}
+
+// parseMCPTarget reads the transport and endpoint that follow a server name:
+// an explicit `http|sse <url>` / `stdio "<command>"`, or a bare URL taking
+// the http default.
+func (p *parser) parseMCPTarget(spec *MCPSpec) error {
+	t := p.peek()
+	if t.Kind != TokIdent {
+		return p.errorAt(t,
+			"expected a URL or a transport (http, sse, stdio) after mcp server %q, got %s",
+			spec.Name, t)
+	}
+	switch t.Val {
+	case config.MCPTransportHTTP, config.MCPTransportSSE:
+		spec.Transport = t.Val
+		p.advance()
+		return p.parseMCPURL(spec)
+	case config.MCPTransportStdio:
+		spec.Transport = config.MCPTransportStdio
+		p.advance()
+		cmd := p.peek()
+		if cmd.Kind != TokString {
+			return p.errorAt(cmd,
+				"expected a quoted command after 'stdio' for mcp server %q, got %s",
+				spec.Name, cmd)
+		}
+		argv := strings.Fields(cmd.Val)
+		if len(argv) == 0 {
+			return p.errorAt(cmd, "empty stdio command for mcp server %q", spec.Name)
+		}
+		spec.Command = argv
+		p.advance()
+		return nil
+	default:
+		// No transport keyword: the token must be the URL itself.
+		spec.Transport = config.MCPTransportHTTP
+		return p.parseMCPURL(spec)
+	}
+}
+
+// parseMCPURL consumes and validates the endpoint of an http/sse server.
+func (p *parser) parseMCPURL(spec *MCPSpec) error {
+	t := p.peek()
+	if t.Kind != TokIdent {
+		return p.errorAt(t, "expected a URL for mcp server %q, got %s", spec.Name, t)
+	}
+	if err := validateMCPURL(t.Val); err != nil {
+		return p.errorAt(t, "mcp server %q: %v", spec.Name, err)
+	}
+	spec.URL = t.Val
+	p.advance()
+	return nil
+}
+
+// parseMCPModifiers reads the repeatable `header "..."` / `env NAME` trailers
+// of one mcp entry, stopping at the end of the line.
+func (p *parser) parseMCPModifiers(spec *MCPSpec) error {
+	for {
+		t := p.peek()
+		if t.Kind != TokIdent {
+			return nil
+		}
+		switch t.Val {
+		case "header":
+			p.advance()
+			v := p.peek()
+			if v.Kind != TokString {
+				return p.errorAt(v,
+					"expected a quoted \"Name: value\" after 'header' for mcp server %q, got %s",
+					spec.Name, v)
+			}
+			if err := validateMCPHeader(v.Val); err != nil {
+				return p.errorAt(v, "mcp server %q: %v", spec.Name, err)
+			}
+			if spec.Transport == config.MCPTransportStdio {
+				return p.errorAt(t, "mcp server %q: 'header' applies to http/sse servers, not stdio", spec.Name)
+			}
+			spec.Headers = append(spec.Headers, v.Val)
+			p.advance()
+		case "env":
+			p.advance()
+			v := p.peek()
+			if v.Kind != TokIdent {
+				return p.errorAt(v,
+					"expected a variable name after 'env' for mcp server %q, got %s", spec.Name, v)
+			}
+			if err := envspec.ValidateName(v.Val); err != nil {
+				return p.errorAt(v, "mcp server %q: %v", spec.Name, err)
+			}
+			if spec.Transport != config.MCPTransportStdio {
+				return p.errorAt(t,
+					"mcp server %q: 'env' applies to stdio servers; pass a credential to an "+
+						"http/sse server with header \"Authorization: Bearer ${VAR}\"", spec.Name)
+			}
+			spec.Env = append(spec.Env, v.Val)
+			p.advance()
+		default:
+			// Not a modifier — leave it for the caller's end-of-entry check,
+			// which reports it against the entry as a whole.
+			return nil
+		}
+	}
+}
+
+// validateMCPName rejects server names that would not survive the round trip
+// into the guest's MCP config or the agent's tool namespace. Claude Code
+// derives tool names from the server name, so keep it to the conservative
+// set every runner tolerates.
+func validateMCPName(name string) error {
+	if name == "" {
+		return errors.New("empty mcp server name")
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.':
+		default:
+			return fmt.Errorf("invalid mcp server name %q: use letters, digits, '-', '_' or '.'", name)
+		}
+	}
+	return nil
+}
+
+// validateMCPURL requires an absolute http(s) URL with a host and no
+// credentials in it. Catching this at parse time means the
+// network-derivation step downstream can assume it has a host to allow.
+//
+// Userinfo is refused rather than accepted-and-ignored because it is the one
+// way to smuggle a secret VALUE past the design invariant that clawk stores
+// only references: the URL is persisted verbatim onto the sandbox record and
+// rendered into the guest MCP config, both of which sit unencrypted on host
+// disk. `header "Authorization: Bearer ${VAR}"` is the supported spelling,
+// and it keeps the value in the runner's process environment. See
+// config.MCPServer.
+func validateMCPURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid URL %q: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("URL %q must use http or https", raw)
+	}
+	if u.Hostname() == "" {
+		return fmt.Errorf("URL %q has no host", raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf(
+			"URL %q embeds credentials — clawk would store them on disk; "+
+				"drop the user:password@ and pass the credential with "+
+				"header \"Authorization: Bearer ${VAR}\" instead",
+			u.Redacted())
+	}
+	return nil
+}
+
+// validateMCPHeader requires the "Name: value" spelling, so the rendered
+// config never carries a header the runner will silently drop.
+func validateMCPHeader(h string) error {
+	name, _, ok := strings.Cut(h, ":")
+	if !ok || strings.TrimSpace(name) == "" {
+		return fmt.Errorf("invalid header %q: want \"Name: value\"", h)
+	}
+	return nil
 }
 
 // parseAgentBlock handles `agent ( instructions ... | memory "..." )` — the

@@ -31,6 +31,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +40,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/mdlayher/vsock"
+	"golang.org/x/sys/unix"
 )
 
 // ────────────────────────────────────────────────────────────────────────
@@ -632,6 +634,14 @@ func main() {
 	// proxy yet).
 	go runReverseForwarder(logger)
 
+	// Serial forwarder: holds a control connection to the host, creates a
+	// PTY at /dev/<name> for every serial device the host publishes, and
+	// bridges each one to the physical port while a process in here has it
+	// open. Idle unless the sandbox has serial devices configured; retries
+	// forever if the host end isn't there, exactly like the reverse
+	// forwarder above.
+	go runSerialForwarder(logger)
+
 	var wg sync.WaitGroup
 	for {
 		conn, err := listener.Accept()
@@ -997,7 +1007,7 @@ func revfwdReadLine(r *bufio.Reader, v any) error {
 // exactly memReportBytes of snapshot, then close. The host's idle watchdog
 // (internal/cli) polls the same snapshot for the activity fields — load and
 // network I/O — to tell a quiescent guest from one still working detached.
-// The wire format is five big-endian uint64s and MUST stay in lock-step
+// The wire format is seven big-endian uint64s and MUST stay in lock-step
 // with machine/vz/memreport.go (memReport / decodeMemReport):
 //
 //	[0:8]   MemTotal      (KiB)
@@ -1005,6 +1015,8 @@ func revfwdReadLine(r *bufio.Reader, v any) error {
 //	[16:24] memory PSI "some avg10" × 100 (0 if PSI unavailable)
 //	[24:32] /proc/loadavg load1 × 100
 //	[32:40] cumulative rx+tx bytes across non-lo interfaces
+//	[40:48] SwapTotal     (KiB)
+//	[48:56] SwapFree      (KiB)
 //
 // Hosts accept the legacy 24-byte prefix alone, so new fields may only be
 // appended, never reordered.
@@ -1016,8 +1028,8 @@ const (
 	// (1026). Keep in sync with machine/vz/memreport.go's agentMemPort.
 	memReportVSockPort = 1027
 
-	// memReportBytes is the fixed snapshot size (5 × uint64).
-	memReportBytes = 40
+	// memReportBytes is the fixed snapshot size (7 × uint64).
+	memReportBytes = 56
 )
 
 // runMemReporter listens on memReportVSockPort and writes a fresh memory
@@ -1046,15 +1058,17 @@ func runMemReporter(logger *log.Logger) {
 // files, so this runs inline rather than in a goroutine.
 func serveMemReport(conn net.Conn, logger *log.Logger) {
 	defer conn.Close()
-	total, avail := readMemInfo()
+	mem := readMemInfo()
 	psi := readMemPSICenti()
 
 	var buf [memReportBytes]byte
-	binary.BigEndian.PutUint64(buf[0:8], total)
-	binary.BigEndian.PutUint64(buf[8:16], avail)
+	binary.BigEndian.PutUint64(buf[0:8], mem.total)
+	binary.BigEndian.PutUint64(buf[8:16], mem.avail)
 	binary.BigEndian.PutUint64(buf[16:24], psi)
 	binary.BigEndian.PutUint64(buf[24:32], readLoad1Centi())
 	binary.BigEndian.PutUint64(buf[32:40], readNetIOBytes())
+	binary.BigEndian.PutUint64(buf[40:48], mem.swapTotal)
+	binary.BigEndian.PutUint64(buf[48:56], mem.swapFree)
 
 	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	if _, err := conn.Write(buf[:]); err != nil && !isClosedConn(err) {
@@ -1062,14 +1076,30 @@ func serveMemReport(conn net.Conn, logger *log.Logger) {
 	}
 }
 
-// readMemInfo returns MemTotal and MemAvailable from /proc/meminfo in KiB.
-// Missing fields read as zero; a zero MemTotal tells the host "no usable
-// data", which it treats as absent rather than "guest has no memory".
-func readMemInfo() (total, avail uint64) {
+// meminfo is the slice of /proc/meminfo the host's balloon controller
+// reads. The swap pair matters because MemAvailable is by definition what
+// the guest can reclaim *without* swapping: a guest that has pushed its
+// cold anonymous pages out looks roomy by that measure alone, and the
+// controller would answer by taking the memory back (see guestDesiredTarget
+// in machine/vz/balloon.go).
+type meminfo struct {
+	total     uint64
+	avail     uint64
+	swapTotal uint64
+	swapFree  uint64
+}
+
+// readMemInfo returns the meminfo fields in KiB. Missing fields read as
+// zero; a zero total tells the host "no usable data", which it treats as
+// absent rather than "guest has no memory". A guest with no swap device
+// reports zero for both swap fields, which is also what a pre-swap guest
+// agent's shorter report decodes to.
+func readMemInfo() meminfo {
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
-		return 0, 0
+		return meminfo{}
 	}
+	var m meminfo
 	for _, line := range strings.Split(string(data), "\n") {
 		key, rest, ok := strings.Cut(line, ":")
 		if !ok {
@@ -1077,12 +1107,16 @@ func readMemInfo() (total, avail uint64) {
 		}
 		switch key {
 		case "MemTotal":
-			total = parseMeminfoKiB(rest)
+			m.total = parseMeminfoKiB(rest)
 		case "MemAvailable":
-			avail = parseMeminfoKiB(rest)
+			m.avail = parseMeminfoKiB(rest)
+		case "SwapTotal":
+			m.swapTotal = parseMeminfoKiB(rest)
+		case "SwapFree":
+			m.swapFree = parseMeminfoKiB(rest)
 		}
 	}
-	return total, avail
+	return m
 }
 
 // parseMeminfoKiB parses a "   4033244 kB" meminfo value into its KiB number.
@@ -1170,4 +1204,750 @@ func readMemPSICenti() uint64 {
 		}
 	}
 	return 0
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Serial forwarder
+//
+// Wire protocol kept in lock-step with internal/serialfwd in the parent
+// repo; any change there must be mirrored here. Two connection kinds, both
+// guest-initiated, both starting with one JSON greeting line:
+//
+//	op=control   the host answers with the full device set now and again on
+//	             every change, so `clawk serial add` applies to a running
+//	             sandbox.
+//	op=attach    the host validates the device name, opens the physical
+//	             port, answers ok, and then speaks frames.
+//
+// For each device the host publishes we create a PTY, symlink it to
+// /dev/<name>, and hold the master. The attach connection exists for
+// exactly as long as some process in here holds the slave open, which is
+// what makes the host open and close the real port in step — see the
+// serialfwd package comment for why that matters to an Arduino.
+// ────────────────────────────────────────────────────────────────────────
+
+const (
+	// serialVSockPort is the host-side port serving both kinds. Mirrors
+	// serialfwd.VSockPort. Distinct from the pty agent (1024), time-sync
+	// (1025), ssh-agent (1026), mem-report (1027) and reverse-forward
+	// (1028).
+	serialVSockPort = 1029
+
+	// serialProtoVersion mirrors serialfwd.ProtoVersion.
+	serialProtoVersion = 1
+
+	// serialMaxLine mirrors serialfwd.MaxLineBytes.
+	serialMaxLine = 64 * 1024
+
+	// serialFrameHeaderBytes / serialMaxFrame mirror
+	// serialfwd.FrameHeaderBytes and serialfwd.MaxFrameBytes.
+	serialFrameHeaderBytes = 5
+	serialMaxFrame         = 256 * 1024
+
+	// Frame types, mirroring serialfwd.FrameData / serialfwd.FrameMode.
+	serialFrameData byte = 0x01
+	serialFrameMode byte = 0x02
+
+	// serialControlMinBackoff / serialControlMaxBackoff bound the retry
+	// delay when the host end isn't answering — the first moments of every
+	// boot, and permanently under firecracker. Same reasoning as the
+	// reverse forwarder's.
+	serialControlMinBackoff = 1 * time.Second
+	serialControlMaxBackoff = 30 * time.Second
+
+	// serialStableSession is how long a control connection must last to
+	// count as healthy and reset the backoff.
+	serialStableSession = 30 * time.Second
+
+	// serialPollInterval is how long the per-device loop parks waiting for
+	// output from its PTY client.
+	//
+	// It is a timeout rather than a pure block because a PTY delivers no
+	// event when its client changes the line configuration: master and
+	// slave share the termios state, so the change is visible to a
+	// tcgetattr but wakes nothing. The loop therefore has to look, and this
+	// is how often. 100ms is far below human perception for "the monitor
+	// opened at the wrong baud" and cheap enough to run only while a
+	// process actually holds the device open.
+	serialPollInterval = 100 * time.Millisecond
+
+	// serialReopenMinInterval / serialReopenMaxInterval bound how often a
+	// detached device checks whether a client has come back.
+	//
+	// It starts fast on purpose. A board being flashed goes through
+	// close-then-immediately-reopen (the 1200-baud touch, then the
+	// bootloader's port), and a slow first check would add dead time to
+	// every upload. It backs off because an idle sandbox with a forwarded
+	// board that nobody is using shouldn't wake the vCPU 50 times a second
+	// forever.
+	serialReopenMinInterval = 20 * time.Millisecond
+	serialReopenMaxInterval = 500 * time.Millisecond
+
+	// serialAttachRetryInterval is the pause after the host refuses an
+	// attach — an unplugged board, or one held by something else on the
+	// Mac. The client in here still has the PTY open, so we keep trying,
+	// just not in a spin.
+	serialAttachRetryInterval = 1 * time.Second
+
+	// serialDrainMaxReads caps how many buffered reads the hangup path
+	// flushes before giving up — see drainToHost. A PTY's input queue is a
+	// few kilobytes and forwardOutput moves 4 KiB a time, so this is roughly
+	// an order of magnitude of headroom over anything reachable: a backstop
+	// against spinning if a read ever reports data it does not deliver, not
+	// a limit on legitimate writes.
+	serialDrainMaxReads = 16
+)
+
+// serialDevDir is where forwarded devices are published, and
+// serialDialHost is how the host end is reached. Both are variables solely
+// so the agent's own tests can point them at a temp directory and a local
+// listener: creating a node in /dev needs root, and AF_VSOCK needs a
+// hypervisor. Nothing at runtime reassigns either.
+var (
+	serialDevDir = "/dev"
+
+	serialDialHost = func() (net.Conn, error) {
+		return vsock.Dial(vsockHostCID, serialVSockPort, nil)
+	}
+)
+
+type serialGreeting struct {
+	Op   string      `json:"op"`
+	V    int         `json:"v"`
+	Name string      `json:"name,omitempty"`
+	Mode *serialMode `json:"mode,omitempty"`
+}
+
+type serialSnapshot struct {
+	Devices []serialDeviceMsg `json:"devices"`
+}
+
+type serialDeviceMsg struct {
+	Name string `json:"name"`
+}
+
+type serialAttachReply struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+type serialMode struct {
+	Baud   int    `json:"baud"`
+	Bits   int    `json:"bits"`
+	Parity string `json:"parity"`
+	Stop   int    `json:"stop"`
+}
+
+// serialForwarder owns the per-device PTYs, keyed by guest-visible name.
+type serialForwarder struct {
+	log *log.Logger
+
+	mu      sync.Mutex
+	devices map[string]*serialDevice
+}
+
+// runSerialForwarder keeps the control connection to the host alive,
+// applying every device set the host publishes. Never returns.
+func runSerialForwarder(logger *log.Logger) {
+	f := &serialForwarder{log: logger, devices: make(map[string]*serialDevice)}
+	backoff := serialControlMinBackoff
+	quiet := false
+	for {
+		start := time.Now()
+		err := f.controlSession()
+		// Every PTY exists to reach a port through the host, so once the
+		// host is gone they must go too: a device node left in /dev would
+		// accept an open and then sit mute, which reads as broken hardware
+		// rather than an absent forward.
+		f.apply(nil)
+
+		if time.Since(start) >= serialStableSession {
+			backoff, quiet = serialControlMinBackoff, false
+		}
+		if err != nil && !quiet {
+			logger.Printf("serial: %v (retrying, quietly from here)", err)
+			quiet = true
+		}
+		time.Sleep(backoff)
+		if backoff *= 2; backoff > serialControlMaxBackoff {
+			backoff = serialControlMaxBackoff
+		}
+	}
+}
+
+// controlSession dials the host and applies snapshots until the connection
+// drops. A clean EOF (the host shutting down) returns nil.
+func (f *serialForwarder) controlSession() error {
+	conn, err := serialDialHost()
+	if err != nil {
+		return fmt.Errorf("vsock dial host:%d: %w", serialVSockPort, err)
+	}
+	defer conn.Close()
+
+	if err := serialWriteLine(conn, serialGreeting{
+		Op: "control", V: serialProtoVersion,
+	}); err != nil {
+		return fmt.Errorf("sending control greeting: %w", err)
+	}
+	r := bufio.NewReaderSize(conn, serialMaxLine)
+	for {
+		var snap serialSnapshot
+		if err := serialReadLine(r, &snap); err != nil {
+			if errors.Is(err, io.EOF) || isClosedConn(err) {
+				return nil
+			}
+			return fmt.Errorf("reading device set: %w", err)
+		}
+		f.apply(snap.Devices)
+	}
+}
+
+// apply reconciles the live PTYs with want, which is always the complete
+// desired set.
+func (f *serialForwarder) apply(want []serialDeviceMsg) {
+	desired := make(map[string]bool, len(want))
+	for _, d := range want {
+		if err := validSerialName(d.Name); err != nil {
+			f.log.Printf("serial: ignoring device: %v", err)
+			continue
+		}
+		desired[d.Name] = true
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for name, dev := range f.devices {
+		if desired[name] {
+			continue
+		}
+		dev.stop()
+		delete(f.devices, name)
+	}
+	for name := range desired {
+		if _, ok := f.devices[name]; ok {
+			continue
+		}
+		dev, err := newSerialDevice(f.log, name)
+		if err != nil {
+			f.log.Printf("serial: %s: %v", name, err)
+			continue
+		}
+		f.devices[name] = dev
+		f.log.Printf("serial: /dev/%s -> %s", name, dev.slavePath)
+		go dev.run()
+	}
+}
+
+// serialDevice is one forwarded port: a PTY whose master we hold, a symlink
+// in /dev pointing at its slave, and — whenever some process in here has
+// that slave open — a vsock connection to the physical port on the host.
+type serialDevice struct {
+	log  *log.Logger
+	name string
+
+	master    *os.File
+	slavePath string
+	linkPath  string
+
+	done chan struct{}
+	once sync.Once
+
+	// conn and mode belong to the current attachment. Only run() touches
+	// them, so they need no lock; the reader goroutine gets its own handle.
+	conn net.Conn
+	mode serialMode
+}
+
+// newSerialDevice creates the PTY and publishes it at /dev/<name>.
+func newSerialDevice(logger *log.Logger, name string) (*serialDevice, error) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		return nil, fmt.Errorf("opening pty: %w", err)
+	}
+	slavePath := slave.Name()
+
+	// The agent runs as root but the tools that will open this don't, and
+	// devpts hands out slaves as root:tty 0620. A sandbox is single-user by
+	// construction, so widening this is not the concession it would be on a
+	// shared machine.
+	if err := os.Chmod(slavePath, 0o666); err != nil {
+		_ = slave.Close()
+		_ = master.Close()
+		return nil, fmt.Errorf("chmod %s: %w", slavePath, err)
+	}
+
+	linkPath := filepath.Join(serialDevDir, name)
+	// Replace rather than fail: a stale link from a previous boot, or from
+	// a device that was removed and re-added, is the normal case.
+	if err := os.Remove(linkPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		_ = slave.Close()
+		_ = master.Close()
+		return nil, fmt.Errorf("clearing %s: %w", linkPath, err)
+	}
+	if err := os.Symlink(slavePath, linkPath); err != nil {
+		_ = slave.Close()
+		_ = master.Close()
+		return nil, fmt.Errorf("linking %s: %w", linkPath, err)
+	}
+
+	// Put the line in raw mode before anyone can open it.
+	//
+	// A fresh PTY comes up cooked — ICANON, ECHO, OPOST — and that default
+	// is actively wrong for a forwarded serial port. Echo is the harmful
+	// part: with it on, every byte the board sends is echoed straight back
+	// out to the board, which turns a chatty device into a loop. Canonical
+	// mode is merely surprising, holding input back until a newline that a
+	// binary protocol never sends.
+	//
+	// A real tty has the same unhelpful defaults, and every serial tool
+	// fixes them on open — but the tools are not the only clients here, and
+	// a device that misbehaves for `cat` is a device people will assume is
+	// broken. Anything that does configure the port overrides this anyway.
+	if err := rawSerialPTY(int(master.Fd())); err != nil {
+		_ = slave.Close()
+		_ = master.Close()
+		return nil, fmt.Errorf("raw mode: %w", err)
+	}
+
+	// Prime the hangup state by closing our own handle on the slave.
+	//
+	// This is what makes "is a client attached?" answerable. A PTY that has
+	// never had its slave opened polls exactly like one that is open and
+	// idle — no POLLHUP either way — so without this the loop would think a
+	// client was present from the moment the device appeared and would open
+	// the physical port for nobody. Opening and closing the slave once
+	// drives the master into the sticky hangup state, and from then on
+	// POLLHUP means precisely "nothing in here has it open".
+	_ = slave.Close()
+
+	return &serialDevice{
+		log:       logger,
+		name:      name,
+		master:    master,
+		slavePath: slavePath,
+		linkPath:  linkPath,
+		done:      make(chan struct{}),
+	}, nil
+}
+
+func (d *serialDevice) stop() {
+	d.once.Do(func() { close(d.done) })
+}
+
+// run is the device's whole life: watch the PTY for a client, hold an
+// attachment to the host while one is there, and move bytes and mode
+// changes between them.
+func (d *serialDevice) run() {
+	defer func() {
+		d.detach()
+		_ = d.master.Close()
+		// Only remove the link if it is still ours. A device removed and
+		// re-added in quick succession may already have been relinked to a
+		// new PTY by the time this runs.
+		if target, err := os.Readlink(d.linkPath); err == nil && target == d.slavePath {
+			_ = os.Remove(d.linkPath)
+		}
+	}()
+
+	reopen := serialReopenMinInterval
+	for {
+		select {
+		case <-d.done:
+			return
+		default:
+		}
+
+		events, err := pollSerialMaster(d.master, serialPollInterval)
+		if err != nil {
+			d.log.Printf("serial: %s: poll: %v", d.name, err)
+			return
+		}
+
+		if events&unix.POLLHUP != 0 {
+			// Nothing in here holds the device open — but it may have left
+			// something behind, so this is a flush-then-let-go, not a
+			// let-go. POLLIN and POLLHUP are independent: n_tty_poll reports
+			// the first from input_available_p() and the second from
+			// TTY_OTHER_CLOSED, so a writer that opened, wrote and closed
+			// inside one poll interval arrives here with its bytes still
+			// readable. Honouring the hangup without draining first threw
+			// them away, which lost `echo cmd > /dev/ttyACM0` — and every
+			// script that does printf into a device — with no error anywhere.
+			//
+			// Attach if that is what it takes to have somewhere to put them.
+			if events&unix.POLLIN != 0 && d.conn == nil {
+				d.attach()
+			}
+			// Mode first, for the reason the steady-state path below gives,
+			// and because a 1200-baud touch is a mode change immediately
+			// followed by a close where the mode is the entire message:
+			// losing it would mean a native-USB board never enters its
+			// bootloader.
+			d.syncMode()
+			if events&unix.POLLIN != 0 {
+				d.drainToHost()
+			}
+			d.detach()
+
+			select {
+			case <-d.done:
+				return
+			case <-time.After(reopen):
+			}
+			if reopen *= 2; reopen > serialReopenMaxInterval {
+				reopen = serialReopenMaxInterval
+			}
+			continue
+		}
+		reopen = serialReopenMinInterval
+
+		if d.conn == nil {
+			if !d.attach() {
+				select {
+				case <-d.done:
+					return
+				case <-time.After(serialAttachRetryInterval):
+				}
+				continue
+			}
+		}
+
+		// Mode before data, every iteration. Neither order is right in
+		// general — the kernel gives no way to place a termios change
+		// within the byte stream — but this one matches how tools behave:
+		// they configure the port and then talk on it, so a change seen in
+		// the same wakeup as some output almost always preceded it.
+		d.syncMode()
+
+		if events&unix.POLLIN != 0 {
+			if !d.forwardOutput() {
+				d.detach()
+			}
+		}
+	}
+}
+
+// drainToHost flushes whatever the PTY still holds through to the physical
+// port. Called on the hangup path, where a writer has already gone.
+//
+// forwardOutput moves at most one buffer per call, so a writer that left more
+// than that behind needs several — hence the loop, with a non-blocking poll
+// between reads to stop as soon as the queue is empty. serialDrainMaxReads
+// bounds it: the PTY's own input queue is finite, so the cap is a backstop
+// against spinning rather than a real limit, and it is logged if it is ever
+// reached.
+//
+// Note what the caller's attach means for a board wired for auto-reset:
+// opening the host port asserts DTR, so flushing a one-shot write pulses
+// RESET. That is the right trade — the user explicitly wrote to the device,
+// and dropping the write silently is worse than a reset. Holding the port
+// open (`exec 3<>/dev/ttyACM0`) is how you write repeatedly without one.
+func (d *serialDevice) drainToHost() {
+	if d.conn == nil {
+		return // attach failed; nothing to flush through
+	}
+	for i := 0; i < serialDrainMaxReads; i++ {
+		if !d.forwardOutput() {
+			return
+		}
+		// Timeout 0: ask what is pending right now and never park. The
+		// hangup is already latched, so a blocking poll here would return
+		// immediately anyway — but only because of that, and relying on it
+		// would be a trap for whoever next changes this loop.
+		events, err := pollSerialMaster(d.master, 0)
+		if err != nil || events&unix.POLLIN == 0 {
+			return
+		}
+	}
+	d.log.Printf("serial: %s: stopped draining after %d reads", d.name, serialDrainMaxReads)
+}
+
+// attach opens a connection to the physical port on the host. Reports
+// whether the device is ready to carry traffic.
+func (d *serialDevice) attach() bool {
+	mode, err := readSerialMode(d.master)
+	if err != nil {
+		d.log.Printf("serial: %s: reading pty mode: %v", d.name, err)
+		return false
+	}
+
+	conn, err := serialDialHost()
+	if err != nil {
+		d.log.Printf("serial: %s: vsock dial host:%d: %v", d.name, serialVSockPort, err)
+		return false
+	}
+	if err := serialWriteLine(conn, serialGreeting{
+		Op: "attach", V: serialProtoVersion, Name: d.name, Mode: &mode,
+	}); err != nil {
+		d.log.Printf("serial: %s: sending attach greeting: %v", d.name, err)
+		_ = conn.Close()
+		return false
+	}
+
+	r := bufio.NewReaderSize(conn, serialMaxLine)
+	var reply serialAttachReply
+	if err := serialReadLine(r, &reply); err != nil {
+		d.log.Printf("serial: %s: reading attach reply: %v", d.name, err)
+		_ = conn.Close()
+		return false
+	}
+	if !reply.OK {
+		d.log.Printf("serial: %s: host refused: %s", d.name, reply.Error)
+		_ = conn.Close()
+		return false
+	}
+
+	d.conn, d.mode = conn, mode
+	go d.forwardInput(conn, r)
+	d.log.Printf("serial: %s attached (%d baud)", d.name, mode.Baud)
+	return true
+}
+
+// detach tears down the current attachment, if any. The host closes the
+// physical port when this connection goes, which is the other half of the
+// open/close pairing that gives a board its reset pulse.
+func (d *serialDevice) detach() {
+	if d.conn == nil {
+		return
+	}
+	_ = d.conn.Close()
+	d.conn = nil
+	d.log.Printf("serial: %s detached", d.name)
+}
+
+// forwardInput pumps frames from the host into the PTY. It owns conn's read
+// side for the lifetime of the attachment and exits when detach closes it.
+func (d *serialDevice) forwardInput(conn net.Conn, r *bufio.Reader) {
+	for {
+		typ, payload, err := serialReadFrame(r)
+		if err != nil {
+			if !errors.Is(err, io.EOF) && !isClosedConn(err) {
+				d.log.Printf("serial: %s: reading frame: %v", d.name, err)
+			}
+			return
+		}
+		switch typ {
+		case serialFrameData:
+			if _, err := d.master.Write(payload); err != nil {
+				// EIO here means the client let go between the host
+				// sending and us writing. Not worth a log line: the poll
+				// loop is about to notice the hangup anyway.
+				return
+			}
+		default:
+			// The host only ever sends data today. Ignoring the rest keeps
+			// a future frame type from being a breaking change.
+		}
+	}
+}
+
+// forwardOutput moves one batch of PTY output to the host. Reports whether
+// the attachment is still good.
+func (d *serialDevice) forwardOutput() bool {
+	buf := make([]byte, 4096)
+	n, err := d.master.Read(buf)
+	if n > 0 {
+		if werr := serialWriteFrame(d.conn, serialFrameData, buf[:n]); werr != nil {
+			d.log.Printf("serial: %s: writing to host: %v", d.name, werr)
+			return false
+		}
+	}
+	if err != nil {
+		// EIO is the client closing the slave, which the next poll reports
+		// as POLLHUP; everything else is the PTY going away under us.
+		return false
+	}
+	return true
+}
+
+// syncMode forwards the PTY's line configuration to the host when it has
+// changed since the last time we looked.
+func (d *serialDevice) syncMode() {
+	if d.conn == nil {
+		return
+	}
+	mode, err := readSerialMode(d.master)
+	if err != nil || mode == d.mode {
+		return
+	}
+	if err := serialWriteFrame(d.conn, serialFrameMode, serialMarshalMode(mode)); err != nil {
+		d.log.Printf("serial: %s: sending mode: %v", d.name, err)
+		return
+	}
+	d.mode = mode
+	d.log.Printf("serial: %s reconfigured (%d baud)", d.name, mode.Baud)
+}
+
+// pollSerialMaster waits for the PTY master to become readable or hang up.
+func pollSerialMaster(f *os.File, timeout time.Duration) (int16, error) {
+	fds := []unix.PollFd{{Fd: int32(f.Fd()), Events: unix.POLLIN}}
+	for {
+		n, err := unix.Poll(fds, int(timeout.Milliseconds()))
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if n == 0 {
+			return 0, nil
+		}
+		return fds[0].Revents, nil
+	}
+}
+
+// readSerialMode reads the line configuration the PTY's client has set.
+//
+// A PTY master and its slave share one termios, so this reads back exactly
+// what the process on the other end asked for — which is the only reason
+// forwarding a serial port through a PTY is possible at all. The one thing
+// it cannot see is the modem-control lines: a PTY has none, and DTR and RTS
+// are simply not expressible here.
+func readSerialMode(f *os.File) (serialMode, error) {
+	t, err := unix.IoctlGetTermios(int(f.Fd()), unix.TCGETS2)
+	if err != nil {
+		return serialMode{}, err
+	}
+
+	mode := serialMode{Baud: int(t.Ospeed), Bits: 8, Parity: "n", Stop: 1}
+	switch t.Cflag & unix.CSIZE {
+	case unix.CS5:
+		mode.Bits = 5
+	case unix.CS6:
+		mode.Bits = 6
+	case unix.CS7:
+		mode.Bits = 7
+	}
+	if t.Cflag&unix.PARENB != 0 {
+		mode.Parity = "e"
+		if t.Cflag&unix.PARODD != 0 {
+			mode.Parity = "o"
+		}
+	}
+	if t.Cflag&unix.CSTOPB != 0 {
+		mode.Stop = 2
+	}
+	// A rate of zero means the client hung the line up rather than picked a
+	// speed. Reporting it would fail validation on the host, so keep the
+	// last real value by reporting the tty default.
+	if mode.Baud <= 0 {
+		mode.Baud = 9600
+	}
+	return mode, nil
+}
+
+// rawSerialPTY takes the PTY out of cooked mode. See the call site in
+// newSerialDevice for why that is the right default here.
+func rawSerialPTY(fd int) error {
+	t, err := unix.IoctlGetTermios(fd, unix.TCGETS2)
+	if err != nil {
+		return err
+	}
+	t.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP |
+		unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON
+	t.Oflag &^= unix.OPOST
+	t.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
+	t.Cc[unix.VMIN] = 1
+	t.Cc[unix.VTIME] = 0
+	return unix.IoctlSetTermios(fd, unix.TCSETS2, t)
+}
+
+// validSerialName mirrors serialfwd.ValidDeviceName. The host validates
+// first, but this string becomes a path in /dev on this side, so it is
+// checked again here rather than trusted across the wire.
+func validSerialName(name string) error {
+	switch {
+	case name == "":
+		return errors.New("device name is empty")
+	case len(name) > 64:
+		return fmt.Errorf("device name %q is too long", name)
+	case strings.ContainsAny(name, "/\\"):
+		return fmt.Errorf("device name %q must not contain a path separator", name)
+	case strings.HasPrefix(name, "."):
+		return fmt.Errorf("device name %q must not start with a dot", name)
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.' || r == '-' || r == '_':
+		default:
+			return fmt.Errorf("device name %q contains %q", name, r)
+		}
+	}
+	return nil
+}
+
+// serialMarshalMode encodes a mode for a FrameMode payload. Errors are
+// impossible for this struct, so the signature doesn't carry one.
+func serialMarshalMode(m serialMode) []byte {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return []byte(`{}`)
+	}
+	return b
+}
+
+// serialWriteLine mirrors serialfwd.WriteLine.
+func serialWriteLine(w io.Writer, v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	if len(b)+1 > serialMaxLine {
+		return errors.New("control line too long")
+	}
+	_, err = w.Write(append(b, '\n'))
+	return err
+}
+
+// serialReadLine mirrors serialfwd.ReadLine. The reader must be reused for
+// the frames that follow, or bytes buffered past the newline are lost.
+func serialReadLine(r *bufio.Reader, v any) error {
+	line, err := r.ReadSlice('\n')
+	if errors.Is(err, bufio.ErrBufferFull) {
+		return errors.New("control line too long")
+	}
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(line, v)
+}
+
+// serialWriteFrame mirrors serialfwd.WriteFrame.
+func serialWriteFrame(w io.Writer, typ byte, payload []byte) error {
+	if len(payload) > serialMaxFrame {
+		return errors.New("frame too long")
+	}
+	var hdr [serialFrameHeaderBytes]byte
+	hdr[0] = typ
+	binary.BigEndian.PutUint32(hdr[1:], uint32(len(payload)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	if len(payload) == 0 {
+		return nil
+	}
+	_, err := w.Write(payload)
+	return err
+}
+
+// serialReadFrame mirrors serialfwd.ReadFrame.
+func serialReadFrame(r *bufio.Reader) (byte, []byte, error) {
+	var hdr [serialFrameHeaderBytes]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return 0, nil, err
+	}
+	n := binary.BigEndian.Uint32(hdr[1:])
+	if n > serialMaxFrame {
+		return 0, nil, errors.New("frame too long")
+	}
+	if n == 0 {
+		return hdr[0], nil, nil
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return 0, nil, err
+	}
+	return hdr[0], buf, nil
 }

@@ -18,11 +18,22 @@ type Workspace struct {
 	Repos []Repo    // every repo included by the workspace, in declaration order
 
 	// Policies collects every `policy <name> ( ... )` block declared across
-	// the loaded files — workspace file and its overlay first (broader
-	// scope), then each repo's clawk.mod and overlay. The create paths
-	// register them into the host policy store, so later (nearer) blocks
-	// win a name collision.
+	// the loaded files — the host-wide clawk.mod first, then the workspace
+	// file and its overlay (broader scope), then each repo's clawk.mod and
+	// overlay. The create paths register them into the host policy store, so
+	// later (nearer) blocks win a name collision.
 	Policies []PolicyDef
+
+	// GlobalPath is the host-wide clawk.mod folded in as the lowest layer,
+	// or "" when there is none. Reporting only — its directives have already
+	// been merged into File or a Repo's Clawkfile by the time a caller sees
+	// this. See global.go.
+	GlobalPath string
+
+	// GlobalProfileMatched records that a clawk.mod.<profile> overlay beside
+	// the host-wide file was applied, so a profile satisfied only by the
+	// host-wide layer isn't reported as matching nothing.
+	GlobalProfileMatched bool
 }
 
 // Repo is one git repository brought into a sandbox by a workspace. The
@@ -193,6 +204,14 @@ func loadWorkspaceParsed(abs string, f *File, profile string) (*Workspace, error
 	if err := checkNameCollisions(ws.Repos); err != nil {
 		return nil, err
 	}
+	// The host-wide layer lands last, once the repos are known: fold needs
+	// them to decide which of its scalars a repo has already spoken for.
+	if err := attachGlobal(ws, profile, foldGlobalIntoWorkspace); err != nil {
+		return nil, err
+	}
+	if ws.GlobalProfileMatched {
+		profileMatched = true
+	}
 	if profile != "" && !profileMatched {
 		return nil, fmt.Errorf(
 			"profile %q matched no overlay file (looked for %s.%s beside the workspace file and in each repo)",
@@ -257,16 +276,23 @@ func LoadStandaloneClawkfileWithProfile(dir, profile string) (*Workspace, error)
 	if err != nil {
 		return nil, err
 	}
-	if profile != "" && !matched {
-		return nil, fmt.Errorf("profile %q has no matching overlay in %s",
-			profile, abs)
-	}
-	return &Workspace{
+	ws := &Workspace{
 		Root:     repo.RepoPath,
 		File:     &Template{},
 		Repos:    []Repo{repo},
 		Policies: policies,
-	}, nil
+	}
+	// One repo, so the host-wide layer folds straight under its clawk.mod:
+	// the repo's scalars win, its list entries follow the global ones, and its
+	// `on` hooks keep the per-phase position they have today.
+	if err := attachGlobal(ws, profile, foldGlobalUnderOnlyRepo); err != nil {
+		return nil, err
+	}
+	if profile != "" && !matched && !ws.GlobalProfileMatched {
+		return nil, fmt.Errorf("profile %q has no matching overlay in %s",
+			profile, abs)
+	}
+	return ws, nil
 }
 
 // LoadClawkfilePathWithProfile loads an explicitly-given clawk.mod path,
@@ -302,7 +328,7 @@ func WorkspaceFromGitRepo(dir string) (*Workspace, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Workspace{
+	ws := &Workspace{
 		Root: repoRoot,
 		File: &Template{},
 		Repos: []Repo{{
@@ -310,7 +336,13 @@ func WorkspaceFromGitRepo(dir string) (*Workspace, error) {
 			Path:     repoRoot,
 			RepoPath: repoRoot,
 		}},
-	}, nil
+	}
+	// The repo has no clawk.mod at all — the case the host-wide layer exists
+	// for. It becomes the repo's entire template.
+	if err := attachGlobal(ws, "", foldGlobalUnderOnlyRepo); err != nil {
+		return nil, err
+	}
+	return ws, nil
 }
 
 // resolveRepoWithProfile resolves a workspace repo entry, optionally
@@ -466,7 +498,16 @@ func (w *Workspace) FilterRepos(only []string) (*Workspace, error) {
 		return nil, fmt.Errorf("unknown repo(s): %s (known: %s)",
 			strings.Join(missing, ", "), strings.Join(known, ", "))
 	}
-	return &Workspace{Root: w.Root, File: w.File, Repos: kept, Policies: w.Policies}, nil
+	return &Workspace{
+		Root:     w.Root,
+		File:     w.File,
+		Repos:    kept,
+		Policies: w.Policies,
+		// Carried so the create-time note still names the host-wide file. Its
+		// directives already live in File, which is shared with the original.
+		GlobalPath:           w.GlobalPath,
+		GlobalProfileMatched: w.GlobalProfileMatched,
+	}, nil
 }
 
 // rejectLifecycleAtWorkspace flags the `on <event>` lists that stay repo-local

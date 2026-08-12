@@ -105,12 +105,20 @@ func runVzd(_ *cobra.Command, args []string) (retErr error) {
 	rev := newReverseProxy(logger)
 	rev.Set(sb.ReverseForwards)
 
+	// Serial proxy: publishes the sandbox's forwarded serial ports to the
+	// in-guest agent and bridges each PTY the guest opens through to the
+	// physical device. Built alongside the reverse-forward proxy and for
+	// the same reason — `clawk serial add` needs somewhere to push while
+	// the VM is still booting.
+	ser := newSerialProxy(logger)
+	ser.Set(sb.Serials)
+
 	// Control socket: lets the CLI push network-policy edits into the live
 	// allow list (`clawk network allow` without a down/up cycle), read
 	// the denial ledger (`clawk network denials`), push reverse-forward
 	// edits, and drive the VM lifecycle (`clawk pause/resume/snapshot`).
 	// Best-effort — without it, policy edits apply on the next up, as before.
-	ctl, err := vzdctl.Start(vzdctl.SocketPath(vmDir), controlHandlers(sb, allow, lc, rev, logger))
+	ctl, err := vzdctl.Start(vzdctl.SocketPath(vmDir), controlHandlers(sb, allow, lc, rev, ser, logger))
 	if err != nil {
 		logger.Printf("control socket: disabled (%v) — network edits apply on next up", err)
 	} else {
@@ -213,6 +221,16 @@ func runVzd(_ *cobra.Command, args []string) (retErr error) {
 		logger.Printf("reverse-forward: disabled (%v)", err)
 	} else {
 		defer rev.Stop()
+	}
+
+	// Serial devices: same shape as the reverse forwards above — the guest
+	// agent dials this listener to learn which PTYs to create, and again
+	// each time a process in the sandbox opens one. Best-effort; a failure
+	// here means those devices simply don't appear inside the guest.
+	if err := ser.Start(ctx, m); err != nil {
+		logger.Printf("serial: disabled (%v)", err)
+	} else {
+		defer ser.Stop()
 	}
 
 	// 9p cache servers: one per toolchain cache, each serving its host cache
@@ -337,14 +355,25 @@ func buildOCISandboxSpec(sb *config.Sandbox, vmDir string, allow *netfilter.Allo
 		return machine.Spec{}, fmt.Errorf("guest config disk: %w", err)
 	}
 
+	swapPath, err := sandbox.EnsureSwapDisk(vmDir, sandbox.SwapDiskMiB(sb))
+	if err != nil {
+		return machine.Spec{}, fmt.Errorf("swap disk: %w", err)
+	}
+
 	spec := buildSandboxSpec(sb, vmDir, allow)
 	spec.Boot = machine.DirectKernel{
 		Vmlinux: vmlinux,
 		Cmdline: sandbox.OCICmdline,
 	}
 	spec.RootFS = sandbox.OCIRootFS(sb, store.CacheDir(), bins)
+	// Order is the guest's device order: vdb=guestcfg, vdc=swap
+	// (sandbox.OCISwapDevice). The manifest names that device by path, so
+	// anything added here must go after it.
 	spec.Disks = []machine.Disk{
 		{Path: filepath.Join(vmDir, sandbox.OCIConfigDiskName), ReadOnly: true},
+	}
+	if swapPath != "" {
+		spec.Disks = append(spec.Disks, machine.Disk{Path: swapPath})
 	}
 	return spec, nil
 }

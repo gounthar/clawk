@@ -25,9 +25,11 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -37,6 +39,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -51,9 +54,19 @@ type manifest struct {
 	Hostname string        `json:"hostname,omitempty"`
 	Network  *manifestNet  `json:"network,omitempty"`
 	User     *manifestUser `json:"user,omitempty"`
+	Swap     *swapSpec     `json:"swap,omitempty"`
 	Mounts   []mountSpec   `json:"mounts,omitempty"`
 	Files    []fileSpec    `json:"files,omitempty"`
 	Services []serviceSpec `json:"services,omitempty"`
+}
+
+// swapSpec is the swap device to format and enable. Nil for a sandbox with
+// swap disabled, and absent from manifests written by a clawk that predates
+// swap — an additive field, so an old init ignores it and a new init sees
+// nil, both booting without swap.
+type swapSpec struct {
+	Device     string `json:"device"`
+	Swappiness int    `json:"swappiness,omitempty"`
 }
 
 type manifestNet struct {
@@ -140,6 +153,16 @@ func main() {
 	if m.User != nil {
 		if err := ensureUser(m.User); err != nil {
 			logf("user setup: %v", err)
+		}
+	}
+
+	// Before the mounts and the services, so the guest already has somewhere
+	// to put cold anonymous pages by the time anything starts allocating.
+	// Non-fatal: a sandbox without swap works, it just has no cushion when the
+	// host's balloon controller reclaims its memory.
+	if m.Swap != nil {
+		if err := setupSwap(m.Swap); err != nil {
+			logf("swap: %v", err)
 		}
 	}
 
@@ -300,12 +323,18 @@ func loadManifest() (*manifest, error) {
 	return &m, nil
 }
 
-// waitForDevice opens dev, retrying briefly — virtio-blk probing can race
-// the first userspace instructions on a fast direct-kernel boot.
+// waitForDevice opens dev read-only, retrying briefly — virtio-blk probing
+// can race the first userspace instructions on a fast direct-kernel boot.
 func waitForDevice(dev string, timeout time.Duration) (*os.File, error) {
+	return waitForDeviceFlags(dev, os.O_RDONLY, timeout)
+}
+
+// waitForDeviceFlags is waitForDevice with an explicit open mode, for the
+// swap device, whose header we have to write.
+func waitForDeviceFlags(dev string, flags int, timeout time.Duration) (*os.File, error) {
 	deadline := time.Now().Add(timeout)
 	for {
-		f, err := os.Open(dev)
+		f, err := os.OpenFile(dev, flags, 0)
 		if err == nil {
 			return f, nil
 		}
@@ -314,6 +343,109 @@ func waitForDevice(dev string, timeout time.Duration) (*os.File, error) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Swap
+// ────────────────────────────────────────────────────────────────────────
+
+// setupSwap formats the swap device and enables it.
+//
+// The header is written here rather than shelled out to mkswap(8) for the
+// same reason the user is created by editing /etc/passwd: the rootfs is an
+// arbitrary OCI image, and nothing guarantees util-linux is in it.
+func setupSwap(s *swapSpec) error {
+	if s.Device == "" {
+		return errors.New("manifest declares swap with no device")
+	}
+	f, err := waitForDeviceFlags(s.Device, os.O_RDWR, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		f.Close()
+		return fmt.Errorf("sizing %s: %w", s.Device, err)
+	}
+	err = writeSwapHeader(f, size)
+	f.Close()
+	if err != nil {
+		return err
+	}
+	if err := swapon(s.Device); err != nil {
+		return fmt.Errorf("swapon %s: %w", s.Device, err)
+	}
+	if s.Swappiness > 0 {
+		if err := os.WriteFile("/proc/sys/vm/swappiness",
+			[]byte(strconv.Itoa(s.Swappiness)), 0o644); err != nil {
+			logf("swap: setting swappiness: %v", err)
+		}
+	}
+	logf("swap: enabled %s (%d MiB, swappiness %d)", s.Device, size>>20, s.Swappiness)
+	return nil
+}
+
+// swapMagic is the signature that identifies a formatted swap area. It sits
+// at the very end of the first page, not at its start.
+const swapMagic = "SWAPSPACE2"
+
+// writeSwapHeader lays a version-1 swap header on the device, the layout
+// swapon(2) validates (union swap_header in linux/include/linux/swap.h):
+//
+//	[0:1024)                bootbits, left zero
+//	[1024:1028)             version = 1
+//	[1028:1032)             last_page, the highest usable page index
+//	[1032:1036)             nr_badpages = 0
+//	[1036:1068)             uuid and label, both left zero
+//	[pagesize-10:pagesize)  "SWAPSPACE2"
+//
+// The u32s are native-endian: the kernel reads this as a struct off the
+// device, not as a wire format, and the page size is the running kernel's
+// (arm64 may be 4K or 16K) for the same reason.
+//
+// Rewritten on every boot rather than validated first. It costs one page,
+// and it keeps the header true after the host resizes the device — the
+// alternative is a stale last_page that hands the kernel pages the device no
+// longer has.
+func writeSwapHeader(f *os.File, size int64) error {
+	pageSize := os.Getpagesize()
+	pages := size / int64(pageSize)
+	// The kernel refuses anything under 10 pages outright; a device that
+	// small means the host wrote the wrong file, not that swap is tiny.
+	if pages < 10 {
+		return fmt.Errorf("swap device is %d bytes, too small to format", size)
+	}
+	page := make([]byte, pageSize)
+	binary.NativeEndian.PutUint32(page[1024:1028], 1)                 // version
+	binary.NativeEndian.PutUint32(page[1028:1032], uint32(pages-1))   // last_page
+	binary.NativeEndian.PutUint32(page[1032:1036], 0)                 // nr_badpages
+	copy(page[pageSize-len(swapMagic):], swapMagic)
+	if _, err := f.WriteAt(page, 0); err != nil {
+		return fmt.Errorf("writing swap header: %w", err)
+	}
+	return f.Sync()
+}
+
+// swapFlagDiscard is SWAP_FLAG_DISCARD: discard freed swap pages, which
+// would let the sparse backing file give space back to the host. Neither
+// vz's nor firecracker's virtio-blk advertises discard today and the kernel
+// drops the flag when the device can't honor it, so this is currently a
+// no-op that costs nothing and starts paying if either ever does.
+const swapFlagDiscard = 0x10000
+
+// swapon enables dev as swap. x/sys/unix wraps neither swapon(2) nor its
+// flags, so this goes through the raw syscall.
+func swapon(dev string) error {
+	p, err := unix.BytePtrFromString(dev)
+	if err != nil {
+		return err
+	}
+	_, _, errno := unix.Syscall(
+		unix.SYS_SWAPON, uintptr(unsafe.Pointer(p)), swapFlagDiscard, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 func cmdlineValue(key string) string {

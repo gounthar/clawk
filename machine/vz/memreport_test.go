@@ -59,6 +59,48 @@ func TestDecodeMemReportLegacy(t *testing.T) {
 	require.False(t, got.HasActivity)
 }
 
+// TestDecodeMemReportActivityOnly: a 40-byte report from a guest agent
+// that predates the swap fields keeps everything up to NetIOBytes and
+// reports no swap. Zero swap is indistinguishable from "no swap device",
+// which is why the controller only ever reads these fields as evidence
+// that swap IS in use.
+func TestDecodeMemReportActivityOnly(t *testing.T) {
+	full := encodeMemReport(memReport{
+		TotalKiB: 4 * 1024 * 1024, AvailableKiB: 2_000_000, PSIMemSomeCenti: 17,
+		Load1Centi: 250, NetIOBytes: 4242,
+		SwapTotalKiB: 999, SwapFreeKiB: 999, // must NOT survive the shorter decode
+	})
+	got, err := decodeMemReport(full[:memReportActivitySize])
+	require.NoError(t, err)
+	require.Equal(t, memReport{
+		TotalKiB: 4 * 1024 * 1024, AvailableKiB: 2_000_000, PSIMemSomeCenti: 17,
+		Load1Centi: 250, NetIOBytes: 4242, HasActivity: true,
+	}, got)
+	require.Zero(t, got.SwapUsedKiB())
+}
+
+func TestSwapUsedKiB(t *testing.T) {
+	tests := []struct {
+		name  string
+		total uint64
+		free  uint64
+		want  uint64
+	}{
+		{name: "no swap device", total: 0, free: 0, want: 0},
+		{name: "swap present but untouched", total: 4 << 20, free: 4 << 20, want: 0},
+		{name: "half used", total: 4 << 20, free: 2 << 20, want: 2 << 20},
+		// A report where free exceeds total is nonsense from a torn or
+		// legacy read; it must not underflow into a huge "used".
+		{name: "free above total is not underflow", total: 1024, free: 4096, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := memReport{SwapTotalKiB: tt.total, SwapFreeKiB: tt.free}
+			require.Equal(t, tt.want, r.SwapUsedKiB())
+		})
+	}
+}
+
 func TestDecodeMemReportShort(t *testing.T) {
 	_, err := decodeMemReport(make([]byte, memReportLegacySize-1))
 	require.Error(t, err, "short buffer must error, not zero-pad")

@@ -13,9 +13,9 @@ clawk image gc [--dry-run] [--layers]  # reclaim disks no sandbox needs
 
 `clawk-dev` (`ghcr.io/clawkwork/clawk-dev`) bundles `go`, `node` + `pnpm`,
 `python3` + `uv`, `rustc` + `cargo`, `bun`, `zig`, plus `git`, `gh`, `jq`,
-`ripgrep`, `claude`, and `codex`. The rootfs is rebuilt from the image each
-boot, so bake system dependencies into the image and use `on up` for per-boot
-setup.
+`ripgrep`, `fd-find`, `claude`, `codex`, `pi`, and `opencode`. The rootfs is
+rebuilt from the image each boot, so bake system dependencies into the image
+and use `on up` for per-boot setup.
 
 A sandbox records the image *reference* it was created with, and the
 reference is re-resolved against the registry each time the rootfs is

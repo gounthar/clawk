@@ -36,6 +36,7 @@ sandbox my-project (
         memory     4GiB
         memory_max 8GiB
         disk       64GiB
+        swap       8GiB
         nested
         image      golang:1.25
     )
@@ -63,6 +64,16 @@ sandbox my-project (
         ~/.claude/skills/idiomatic-go   # a local Claude skill — the working way to provision one
         ~/.config/gcloud     /home/agent/.config/gcloud
         ~/.terraform.d                                   rw
+    )
+
+    serial (
+        /dev/cu.usbmodem* ttyACM0   # an Arduino; the glob survives a re-enumeration
+    )
+
+    mcp (
+        linear   https://mcp.linear.app/mcp  header "Authorization: Bearer ${LINEAR_TOKEN}"
+        sentry   sse https://mcp.sentry.dev/sse
+        github   stdio "npx -y @modelcontextprotocol/server-github"  env GITHUB_TOKEN
     )
 
     skills (
@@ -102,7 +113,8 @@ sandbox my-project (
 - `sandbox <name> ( … )` — the header names the template (defaults to the
   directory when omitted: `sandbox ( … )`).
 - `vm ( … )` — runtime shape: `provider`, `cpu`, `memory`, `memory_max`,
-  `disk`, `nested`, `idle_timeout`, `image`, `kernel`. Memory and `disk`
+  `disk`, `swap`, `nested`, `idle_timeout`, `image`, `kernel`. Memory,
+  `disk` and `swap`
   sizes require an explicit unit, case-sensitive: IEC (`MiB`/`GiB`/`TiB`,
   shorthands `M`/`G`/`T`) or SI (`MB`/`GB`/`TB`); SI values convert to MiB
   rounding down (`1GB` → 953 MiB). `disk` sets the root filesystem ceiling
@@ -112,8 +124,16 @@ sandbox my-project (
   written up front. Raise it for repos with large dependency trees. Like
   `cpu` and `memory`, the value is snapshotted when the sandbox is created
   and baked into the rootfs, so editing it affects the next sandbox (or the
-  next rootfs rebuild), not a running one. See [Images](images.md) for
-  `image` and `kernel`, and
+  next rootfs rebuild), not a running one. `swap` sizes the guest's swap
+  device (default 2 GiB, minimum 64 MiB, `swap off` to disable). Every
+  sandbox gets one because clawk reclaims guest RAM under host memory
+  pressure, and a guest with nowhere to page out answers that with
+  multi-second stalls — long enough for a streaming API response to lose its
+  connection. It's a separate sparse file rather than part of the rootfs, so
+  it costs host bytes only as the guest actually swaps, and resizing it takes
+  effect on the next boot rather than on a rootfs rebuild. Across a workspace
+  the largest `swap` wins, but a single `swap off` anywhere disables it for
+  the whole VM. See [Images](images.md) for `image` and `kernel`, and
   [Commands & resource usage](commands.md#resource-usage) for `idle_timeout`.
 - `network ( … )` — egress policy: `allow` / `deny` a domain or `ip <addr>`,
   plus `use <policy>…` chains — see
@@ -143,6 +163,28 @@ sandbox my-project (
   shell-variable shaped (letters, digits, `_`; not starting with a digit) —
   lowercase names like `http_proxy` are fine. Whitespace around `=` is
   optional.
+
+  A declaration here **overrides** any variable clawk would otherwise set
+  for the runner itself, including `CLAUDE_CODE_OAUTH_TOKEN`. That is how a
+  sandbox opts out of clawk's Anthropic credential when it points claude at
+  something else:
+
+  ```text
+  env (
+      ANTHROPIC_BASE_URL      = https://gateway.example
+      CLAUDE_CODE_OAUTH_TOKEN = ""     # don't send Anthropic's token there
+  )
+  ```
+
+  This matters when the gateway needs no credential of its own, or
+  authenticates some other way. Claude Code's credential order is
+  `ANTHROPIC_AUTH_TOKEN` first, then `CLAUDE_CODE_OAUTH_TOKEN`, and an
+  empty value counts as unset — so a sandbox that *does* set
+  `ANTHROPIC_AUTH_TOKEN` already sends the gateway key regardless. Without
+  one, clawk's `sk-ant-oat-…` goes to that third-party endpoint as a
+  `Authorization: Bearer` credential, which is a token leak rather than a
+  broken request. The blunt alternative, `clawk auth clear`, disarms every
+  sandbox on the host.
 - `on create ( … )` / `on up ( … )` — shell hooks. `create` runs once after
   the first boot; `up` runs on every boot. Each command runs inside the
   guest via `bash -lc` as a login shell: variable expansion, globs, and
@@ -156,6 +198,20 @@ sandbox my-project (
   configs that rotate rarely).
 - `shares ( … )` — host directories live-mounted via virtio-fs (good for
   rotating secrets like AWS STS tokens).
+- `serial ( … )` — host serial ports presented as devices in the guest, for
+  microcontroller work. Each line is `<host-device> [<guest-name>]`; the name
+  defaults to the host device's basename, and the host device may be a glob
+  (resolved when the port is opened, which is how a board that re-enumerates
+  into its bootloader stays reachable). vz only, and applied live. See
+  [Serial devices](serial.md).
+- `mcp ( … )` — MCP servers made available to the agent, ready on first
+  boot. See [MCP servers](mcp.md). Each line is
+  `<name> <url>` (http), `<name> http|sse <url>`, or
+  `<name> stdio "<command>"`, followed by any number of
+  `header "Name: value"` (http/sse) or `env NAME` (stdio) modifiers.
+  Declaring a server also allows its host in the egress policy, so it needs
+  no matching `network allow` line. Credentials are referenced, never
+  stored: write `${VAR}` and declare `VAR` in `env ( … )`.
 - `skills ( … )` — a manifest of **distributed** Claude skills
   (`<host.tld>/…` pinned to a version), maintained with `clawk mod tidy`.
   **Fetching skills into the guest is not implemented yet** — until it
@@ -197,6 +253,81 @@ before each repo's own hooks, so it's the place for VM-wide setup that isn't
 tied to any single repo's directory. A repo listed in `includes` keeps its
 own per-worktree `on up` / `on create`; the two scopes are independent and
 both run.
+
+## Host-wide defaults
+
+Some settings are properties of *you*, not of the repo: a kernel path, a token
+alias, a personal skill mount, a house rule about commit messages. Put those in
+one file outside any repo and every sandbox on the machine picks them up —
+including repos with no `clawk.mod` at all.
+
+```text
+# ~/.config/clawk/clawk.mod — never committed, one per host
+sandbox (
+    vm (
+        memory_max 8GiB
+    )
+    network (
+        allow *.internal.myco.com
+    )
+    env (
+        GITHUB_TOKEN = ${MYCO_GH_TOKEN}
+    )
+    shares (
+        ~/.claude/skills/idiomatic-go
+    )
+    agent (
+        instructions ./house-rules.md
+    )
+    on up (
+        "scripts/ensure-swap.sh"
+    )
+)
+```
+
+It is the lowest layer of the chain, narrowest wins:
+
+```text
+built-in defaults < ~/.config/clawk/clawk.mod < namespace < repo clawk.mod
+                  < clawk.mod.<profile> < flags
+```
+
+Lists union with the host-wide entries first (so a conflict message reads
+scope-outward, and `on up` hooks from here run before a repo's). Scalars —
+`provider`, `image`, `kernel`, `cpu`, `memory`, `disk`, `swap`, `idle_timeout` —
+apply only where nothing narrower declared one. Like every other template it is
+read at **sandbox-create time**, so editing it changes the next sandbox you
+create, never one that already exists.
+
+The block must be **anonymous** (`sandbox ( … )`): a header name labels one
+repo's phases, which means nothing for defaults, so a name here is an error
+rather than a silent relabel of every repo on the host. `includes` is rejected
+for the same reason. `policy <name> ( … )` blocks are welcome — that's a
+personal policy library. `namespace` blocks are not: this file declares defaults
+for every sandbox, not named resources, and clawk owns those records itself.
+
+Relative paths (`./house-rules.md`, `./kernels/vmlinux`) resolve against the
+file's own directory, so they keep working from any repo.
+
+**Where it lives**, in resolution order:
+
+| location | notes |
+|---|---|
+| `$CLAWK_GLOBAL_MOD` | explicit override; must exist, or it's an error |
+| `$XDG_CONFIG_HOME/clawk/clawk.mod` | the documented home, default `~/.config/clawk/clawk.mod` |
+| `~/.clawk/clawk.mod` | compatibility fallback |
+
+`~/.config` rather than `~/.clawk` because this is the one file in clawk's
+footprint you hand-edit and might symlink out of a dotfiles repo: `~/.clawk` is
+disposable machine state (VM disks, an image cache, per-sandbox records, a live
+OAuth token) that people exclude from backups and delete to start clean. Having
+both locations present is an error, never a silent precedence pick.
+
+**`--no-global`** ignores the layer entirely — for a CI run or a bug report
+that should depend only on what's in the repo. `CLAWK_GLOBAL_MOD=/path/to/file`
+does the opposite: pins the layer regardless of what the host has in
+`~/.config`. When the layer applies, `clawk work` names the file it came from,
+since it explains configuration nobody can find by reading the repo.
 
 ## How clawk finds the file
 

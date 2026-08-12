@@ -85,7 +85,11 @@ func TestGuestDesiredTarget(t *testing.T) {
 		name string
 		cur  uint64
 		r    memReport
-		want uint64
+		// swapPressure is swapTrend.observe's verdict — swap in use and
+		// recently growing. Its own logic is covered by TestSwapTrend; here it
+		// is an input, so these cases pin what the target does with it.
+		swapPressure bool
+		want         uint64
 	}{
 		{
 			name: "no report holds current",
@@ -129,6 +133,55 @@ func TestGuestDesiredTarget(t *testing.T) {
 			r:    memReport{TotalKiB: baseline / 1024, AvailableKiB: baseline / 1024 / 2},
 			want: baseline, // ceiling == baseline here
 		},
+		// The slack a paging guest shows is manufactured: it evicted to produce
+		// it. Reclaiming on the strength of it is the feedback loop that parks
+		// a working guest at its baseline, swapping, forever.
+		{
+			name: "high slack with swap pressure holds instead of reclaiming",
+			cur:  ceiling,
+			r: memReport{
+				TotalKiB: totalKiB, AvailableKiB: totalKiB / 2, // 50% available > 40%
+				SwapTotalKiB: 4 << 20, SwapFreeKiB: 4<<20 - swapUsedFloorKiB,
+			},
+			swapPressure: true,
+			want:         ceiling,
+		},
+		// Occupancy without pressure is history, not demand: once the trend has
+		// gone quiet the headroom is real and the guest gives memory back. This
+		// is what stops one early spike retiring reclaim for the sandbox's life.
+		{
+			name: "swap held but no longer growing reclaims again",
+			cur:  ceiling,
+			r: memReport{
+				TotalKiB: totalKiB, AvailableKiB: totalKiB / 2,
+				SwapTotalKiB: 4 << 20, SwapFreeKiB: 4<<20 - 2*swapUsedFloorKiB,
+			},
+			swapPressure: false,
+			want:         ceiling - reclaimStepBytes,
+		},
+		// Swap pressure suppresses reclaim, never growth: a guest that is both
+		// paging and stalling still needs the ceiling.
+		{
+			name: "swap pressure does not block growth on demand",
+			cur:  baseline,
+			r: memReport{
+				TotalKiB: totalKiB, AvailableKiB: totalKiB / 2, PSIMemSomeCenti: psiDemandCenti,
+				SwapTotalKiB: 4 << 20, SwapFreeKiB: 0,
+			},
+			swapPressure: true,
+			want:         ceiling,
+		},
+		// An untouched swap device says nothing at all — a guest that never
+		// swapped is as reclaimable as one with no swap device.
+		{
+			name: "swap present but unused reclaims normally",
+			cur:  ceiling,
+			r: memReport{
+				TotalKiB: totalKiB, AvailableKiB: totalKiB / 2,
+				SwapTotalKiB: 4 << 20, SwapFreeKiB: 4 << 20,
+			},
+			want: ceiling - reclaimStepBytes,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -136,10 +189,88 @@ func TestGuestDesiredTarget(t *testing.T) {
 			if tt.name == "no burst headroom collapses to baseline" {
 				c = baseline
 			}
-			got := guestDesiredTarget(tt.cur, baseline, c, tt.r)
+			got := guestDesiredTarget(tt.cur, baseline, c, tt.r, tt.swapPressure)
 			require.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// TestSwapTrend covers the signal that decides swapPressure. The property that
+// matters is that it DECAYS: swap occupancy latches (a slot is freed only when
+// its page is faulted back in or its owner exits), so reading the raw level as
+// pressure pinned a guest that spiked once and then idled, and retired the
+// reclaim path for the rest of its life.
+func TestSwapTrend(t *testing.T) {
+	const total = 4 << 20 // 4 GiB of swap, in KiB
+
+	used := func(kib uint64) memReport {
+		return memReport{TotalKiB: 4 << 20, AvailableKiB: 2 << 20,
+			SwapTotalKiB: total, SwapFreeKiB: total - kib}
+	}
+
+	t.Run("below the floor is no signal", func(t *testing.T) {
+		var s swapTrend
+		for i := 0; i < 3; i++ {
+			require.False(t, s.observe(used(swapUsedFloorKiB-1)))
+		}
+	})
+
+	t.Run("no swap device at all is no signal", func(t *testing.T) {
+		var s swapTrend
+		require.False(t, s.observe(memReport{TotalKiB: 4 << 20, AvailableKiB: 2 << 20}))
+	})
+
+	t.Run("crossing the floor starts a hold", func(t *testing.T) {
+		var s swapTrend
+		require.True(t, s.observe(used(swapUsedFloorKiB)))
+	})
+
+	t.Run("hold decays once growth stops", func(t *testing.T) {
+		var s swapTrend
+		require.True(t, s.observe(used(2*swapUsedFloorKiB)), "first sighting holds")
+		// Same occupancy, report after report: the guest evicted and moved on.
+		for i := 1; i < swapQuietReportsBeforeReclaim; i++ {
+			require.True(t, s.observe(used(2*swapUsedFloorKiB)),
+				"quiet report %d should still hold", i)
+		}
+		require.False(t, s.observe(used(2*swapUsedFloorKiB)),
+			"past the quiet window the occupancy is history, not pressure")
+		require.False(t, s.observe(used(2*swapUsedFloorKiB)), "and stays decayed")
+	})
+
+	t.Run("renewed growth restarts the hold", func(t *testing.T) {
+		var s swapTrend
+		s.observe(used(2 * swapUsedFloorKiB))
+		for i := 0; i < swapQuietReportsBeforeReclaim+5; i++ {
+			s.observe(used(2 * swapUsedFloorKiB))
+		}
+		require.False(t, s.observe(used(2*swapUsedFloorKiB)), "decayed first")
+		require.True(t, s.observe(used(3*swapUsedFloorKiB)),
+			"growing again means the guest is being squeezed now")
+	})
+
+	t.Run("dropping below the floor resets the quiet count", func(t *testing.T) {
+		var s swapTrend
+		s.observe(used(2 * swapUsedFloorKiB))
+		for i := 0; i < swapQuietReportsBeforeReclaim+5; i++ {
+			s.observe(used(2 * swapUsedFloorKiB))
+		}
+		require.False(t, s.observe(used(2*swapUsedFloorKiB)), "decayed")
+		// Pages came back in and the guest fell under the floor; a later rise
+		// must not inherit the stale quiet count.
+		require.False(t, s.observe(used(0)))
+		require.True(t, s.observe(used(2*swapUsedFloorKiB)))
+	})
+
+	t.Run("shrinking swap counts as quiet", func(t *testing.T) {
+		var s swapTrend
+		require.True(t, s.observe(used(10*swapUsedFloorKiB)))
+		// Faulting pages back in is not eviction pressure.
+		for i := 1; i < swapQuietReportsBeforeReclaim; i++ {
+			require.True(t, s.observe(used(uint64(10-i/4)*swapUsedFloorKiB)))
+		}
+		require.False(t, s.observe(used(5*swapUsedFloorKiB)))
+	})
 }
 
 func TestGuestDesiredTargetStaysInRange(t *testing.T) {
@@ -156,7 +287,7 @@ func TestGuestDesiredTargetStaysInRange(t *testing.T) {
 	}
 	for _, cur := range []uint64{baseline, 2 * gib, ceiling} {
 		for _, r := range reports {
-			got := guestDesiredTarget(cur, baseline, ceiling, r)
+			got := guestDesiredTarget(cur, baseline, ceiling, r, false)
 			require.GreaterOrEqual(t, got, uint64(baseline))
 			require.LessOrEqual(t, got, uint64(ceiling))
 		}
@@ -174,18 +305,18 @@ func TestMergedBalloonTargetHostPressureWins(t *testing.T) {
 
 	// Under normal pressure the guest gets what it asks for.
 	require.Equal(t, uint64(ceiling),
-		mergedBalloonTarget(pressureNormal, baseline, baseline, ceiling, starved))
+		mergedBalloonTarget(pressureNormal, baseline, baseline, ceiling, starved, false))
 
 	// Under WARN the host caps growth at balloonTarget(warn, ceiling) even
 	// though the guest is starving.
 	wantWarn := balloonTarget(pressureWarn, ceiling)
 	require.Equal(t, wantWarn,
-		mergedBalloonTarget(pressureWarn, baseline, baseline, ceiling, starved))
+		mergedBalloonTarget(pressureWarn, baseline, baseline, ceiling, starved, false))
 	require.Less(t, wantWarn, uint64(ceiling))
 
 	// Under CRITICAL it caps even lower.
 	wantCrit := balloonTarget(pressureCritical, ceiling)
 	require.Equal(t, wantCrit,
-		mergedBalloonTarget(pressureCritical, baseline, baseline, ceiling, starved))
+		mergedBalloonTarget(pressureCritical, baseline, baseline, ceiling, starved, false))
 	require.Less(t, wantCrit, wantWarn)
 }

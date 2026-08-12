@@ -74,6 +74,18 @@ for the protocol, `internal/cli/reverse_forward.go` for the host end). The
 daemon pushes set changes down the same channel, so those edits apply to a
 running guest. vz only — firecracker's vsock is one-way.
 
+Serial ports (`clawk serial add`) ride the same asymmetry and reuse its whole
+shape: the guest agent creates a PTY per configured device, and holding that
+PTY open is what makes the agent dial the daemon, which validates the device
+name against the configured set and opens the physical tty (`internal/
+serialfwd` for the protocol, `internal/cli/serial_proxy.go` for the host end,
+`internal/serialport` for the tty itself). Passing the USB device through
+instead is not an option on either provider — Virtualization.framework
+exposes no physical USB passthrough and firecracker has no USB bus — and it
+isn't needed: the tooling wants a tty and a baud rate, not a USB endpoint.
+Tying the host-side open to the guest-side open also reproduces the DTR edge
+that resets an Arduino at the moment an upload expects it.
+
 Live allow-list edits reach the running daemon over a control socket
 (`internal/vzdctl`); when the sandbox is down they apply on the next `up`.
 The same socket carries the VM lifecycle verbs: `clawk pause` / `resume`
@@ -105,6 +117,7 @@ because it pins a vendored `gvisor-tap-vsock` fork; everything clawk-specific
 | `internal/agentembed` | The in-guest binaries (clawk-init, pty-agent, time-sync), cross-compiled and injected into the rootfs. |
 | `internal/vsockproto` / `internal/vsockclient` | The host↔guest vsock framing and the host-side client. |
 | `internal/revfwd` | Reverse-forward wire protocol (host loopback services exposed on the guest's loopback), mirrored in the guest agent. |
+| `internal/serialfwd` / `internal/serialport` | Serial-forwarding wire protocol (mirrored in the guest agent) and the host-side tty open/termios. |
 | `internal/netfilter` | Egress allow-list (IPs/CIDRs/domains, DNS-aware) consumed by gvproxy. |
 | `internal/vzdctl` | Daemon control socket (live policy edits, denial ledger, VM pause/resume/suspend). |
 | `internal/worktree` / `internal/pr` | Multi-repo branch coordination and PR creation. |

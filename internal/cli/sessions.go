@@ -31,7 +31,7 @@ func sessionHistoryEnabled(sb *config.Sandbox) bool {
 }
 
 // sessionClaudeDir is the host working tree mounted into the guest as
-// ~/.claude — the same path PersistentClaudeShares serves.
+// ~/.claude — the same path PersistentAgentShares serves.
 func sessionClaudeDir(sb *config.Sandbox) string {
 	return filepath.Join(store.StateDir(sb.Name), "claude")
 }

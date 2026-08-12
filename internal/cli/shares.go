@@ -69,14 +69,17 @@ func collectSandboxShares(sb *config.Sandbox) []machine.Share {
 		}
 	}
 
-	// Per-sandbox persistent state — whole ~/.claude/, pre-seeded with
-	// settings.json/CLAUDE.md/.credentials.json by SeedClaudeStateDir
-	// (called from the provider Create path). Host dir lives outside
-	// VMDir so destroy cannot touch it; the same sandbox name always
-	// sees the same state dir across recreate cycles. MUST come before
-	// DefaultHostShares so the agents/commands sub-mounts land on top
-	// of the parent rather than being shadowed under it.
-	for _, sh := range sandbox.PersistentClaudeShares(store.StateDir(sb.Name)) {
+	// Per-sandbox persistent state — one whole home dir per coding-agent
+	// runner (~/.claude, ~/.codex, ~/.pi). The vz rootfs is re-cloned from
+	// the image on every boot, so these mounts are the ONLY thing keeping a
+	// runner's sessions and login across `clawk down && clawk up`. Claude's
+	// is additionally pre-seeded with settings.json/CLAUDE.md/.credentials.json
+	// by SeedClaudeStateDir (called from the provider Create path). Host dirs
+	// live outside VMDir so destroy cannot touch them; the same sandbox name
+	// always sees the same state dir across recreate cycles. MUST come before
+	// DefaultHostShares so the agents/commands/skills sub-mounts land on top
+	// of their parents rather than being shadowed under them.
+	for _, sh := range sandbox.PersistentAgentShares(store.StateDir(sb.Name)) {
 		out = append(out, machine.Share{
 			HostPath: sh.HostPath,
 			Tag:      sh.Tag,

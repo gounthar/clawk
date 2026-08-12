@@ -95,6 +95,31 @@ func resolveDisk(ws *template.Workspace) uint64 {
 	return disk
 }
 
+// resolveSwap merges the swap directive across a workspace and its repos.
+// An explicit "off" (negative) wins over any size, mirroring how
+// resolveIdleTimeout lets "off" win: a repo that declares `swap off` is
+// saying its workload must not be swapped — a latency measurement, a
+// benchmark — and honoring a different repo's larger size would break that,
+// while the reverse only costs the other repo some headroom. Among sizes the
+// max wins, the same rule as resolveResources: the VM is shared.
+func resolveSwap(ws *template.Workspace) int64 {
+	swap := ws.File.SwapMiB
+	for _, r := range ws.Repos {
+		if r.Clawkfile == nil {
+			continue
+		}
+		v := r.Clawkfile.SwapMiB
+		if v < 0 || swap < 0 {
+			swap = -1
+			continue
+		}
+		if v > swap {
+			swap = v
+		}
+	}
+	return swap
+}
+
 // minDiskMiB is the floor for a per-sandbox `vm ( disk <size> )` override.
 // Below ~1 GiB there is no room for the base image plus any writes, and
 // such a value is almost always a unit typo (disk 32M meaning 32G). Zero

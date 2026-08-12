@@ -40,8 +40,14 @@ FROM node:22-bookworm-slim
 COPY --from=go /usr/local/go /usr/local/go
 ENV PATH=/usr/local/go/bin:$PATH
 
-# Coding agents. claude is what bare `clawk` attaches to; codex is the
-# other built-in runner.
+# Coding agents. claude is what bare `clawk` attaches to; codex, pi, and
+# opencode are the other built-in runners, all installed here so every
+# `clawk run <name>` in the registry works out of the box.
+#
+# opencode-ai resolves a large prebuilt platform binary (~180 MB for
+# linux-arm64) rather than shipping JS, so it dominates this layer's size.
+# Drop it from the list for a slimmer image; `clawk run opencode` then
+# fails with a plain "command not found".
 #
 # The global npm prefix is relocated to /usr/local/npm-global and made
 # world-writable so claude/codex can self-update at runtime. Why not just
@@ -58,6 +64,7 @@ ENV NPM_CONFIG_PREFIX=/usr/local/npm-global
 ENV PATH=/usr/local/npm-global/bin:$PATH
 RUN mkdir -p /usr/local/npm-global \
     && npm install -g @anthropic-ai/claude-code @openai/codex \
+        @earendil-works/pi-coding-agent opencode-ai \
     && npm cache clean --force \
     && chmod -R a+rwX /usr/local/npm-global
 
@@ -68,10 +75,18 @@ RUN mkdir -p /usr/local/npm-global \
 # runs root work through the agent and never needs it. sox is the audio
 # recorder Claude Code's voice dictation falls back to on Linux; it reads
 # the virtio-snd mic (CLAWK_AUDIO_INPUT, on by default) via ALSA.
+#
+# ripgrep and fd-find are here for pi as much as for the agents' own use:
+# pi's search tools look for `rg` and `fd`/`fdfind` on PATH and, finding
+# neither, download release tarballs from GitHub on first run ("fd not
+# found. Downloading..."). Debian ships the fd binary as `fdfind` to avoid
+# a name clash, which is precisely one of the names pi probes for, so the
+# package satisfies it as-is — no symlink needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         curl \
+        fd-find \
         git \
         jq \
         less \

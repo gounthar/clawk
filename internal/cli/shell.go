@@ -89,7 +89,7 @@ func tryVSockShell(sb *config.Sandbox, provider sandbox.Provider) error {
 		Args:       []string{"-l"},
 		Cwd:        agentStartDir(provider, sb),
 		User:       sandbox.GuestUser,
-		Env:        buildVSockEnv(),
+		Env:        buildVSockEnv(sb),
 		// No ClearScreen: a login shell is line-oriented, so keep the
 		// user's scrollback — the shell should read as a continuation of
 		// the terminal it launched from, not a wiped screen.

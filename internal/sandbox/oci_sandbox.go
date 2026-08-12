@@ -106,6 +106,16 @@ func OCIGuestManifest(sb *config.Sandbox, stateDir, cacheDir, rootDir string) (g
 		},
 	}
 
+	// Swap rides on its own virtio-blk disk (EnsureSwapDisk), attached right
+	// after the config disk. Both sides key off SwapDiskMiB, so a sandbox
+	// with swap off gets neither the device nor the manifest entry.
+	if SwapDiskMiB(sb) > 0 {
+		m.Swap = &guestcfg.Swap{
+			Device:     OCISwapDevice,
+			Swappiness: GuestSwappiness,
+		}
+	}
+
 	// Consolidated worktree mount: every managed (non-in-place) worktree for
 	// this sandbox lives under one host parent (store.WorktreeDir), which
 	// collectSandboxShares exposes as a single virtio-fs device. Mount that
@@ -150,10 +160,11 @@ func OCIGuestManifest(sb *config.Sandbox, stateDir, cacheDir, rootDir string) (g
 		})
 	}
 
-	// Host shares, in parent-before-child order: the whole ~/.claude
-	// state mount must precede the skills/agents/commands sub-mounts or
-	// the latter end up shadowed.
-	shares := append([]HostShare{}, PersistentClaudeShares(stateDir)...)
+	// Host shares, in parent-before-child order: the per-runner state
+	// mounts (~/.claude, ~/.codex, ~/.pi) must precede the
+	// skills/agents/commands sub-mounts that land inside them, or the
+	// latter end up shadowed.
+	shares := append([]HostShare{}, PersistentAgentShares(stateDir)...)
 	shares = append(shares, DefaultHostShares()...)
 	shares = append(shares, ToolchainCacheShares(cacheDir)...)
 	shares = append(shares, UserHostShares(sb.Shares)...)

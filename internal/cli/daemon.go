@@ -472,12 +472,20 @@ type reverseForwardSink interface {
 	Set([]config.PortForward)
 }
 
+// serialSink publishes a serial-device set to the in-guest agent. An
+// interface for the same reason reverseForwardSink is one: the only
+// implementation is the darwin serialProxy, and the firecracker daemon
+// passes nil.
+type serialSink interface {
+	Set([]config.SerialDevice)
+}
+
 // controlHandlers builds the control-socket callbacks shared by both VM
 // daemons: the denial ledger, a live network-policy reload from the store,
 // the VM lifecycle surface (pause/resume/suspend), reverse-forward reloads
 // when the daemon has a sink for them, and (when the allow list has one)
 // the interactive gate.
-func controlHandlers(sb *config.Sandbox, allow *netfilter.AllowList, lc *vmLifecycle, rev reverseForwardSink, logger *log.Logger) vzdctl.Handlers {
+func controlHandlers(sb *config.Sandbox, allow *netfilter.AllowList, lc *vmLifecycle, rev reverseForwardSink, ser serialSink, logger *log.Logger) vzdctl.Handlers {
 	h := vzdctl.Handlers{
 		Denials:   allow.Denials,
 		Lifecycle: lc.lifecycleHandlers(),
@@ -505,6 +513,17 @@ func controlHandlers(sb *config.Sandbox, allow *netfilter.AllowList, lc *vmLifec
 			}
 			rev.Set(cur.ReverseForwards)
 			logger.Printf("reverse forwards reloaded: %d", len(cur.ReverseForwards))
+			return nil
+		}
+	}
+	if ser != nil {
+		h.ReloadSerials = func() error {
+			cur, err := store.Load(sb.Name)
+			if err != nil {
+				return fmt.Errorf("reloading sandbox record: %w", err)
+			}
+			ser.Set(cur.Serials)
+			logger.Printf("serial devices reloaded: %d", len(cur.Serials))
 			return nil
 		}
 	}

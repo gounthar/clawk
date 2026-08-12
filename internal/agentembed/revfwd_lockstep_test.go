@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/clawkwork/clawk/internal/revfwd"
+	"github.com/clawkwork/clawk/internal/serialfwd"
 	"github.com/stretchr/testify/require"
 )
 
@@ -60,6 +61,7 @@ func TestGuestVSockPortsAreDistinct(t *testing.T) {
 		{"sshAgentVSockPort", "1026"},
 		{"memReportVSockPort", "1027"},
 		{"reverseForwardVSockPort", fmt.Sprint(revfwd.VSockPort)},
+		{"serialVSockPort", fmt.Sprint(serialfwd.VSockPort)},
 	} {
 		require.Contains(t, src, decl.name+" = "+decl.port,
 			"%s moved; update this test and every mirror of it", decl.name)

@@ -13,6 +13,10 @@ clawk resume [<name>]                  # continue a paused or snapshotted sandbo
 clawk down [<name>]                    # stop; discards any snapshot (next up is a cold boot)
 clawk destroy [<name>]                 # remove (host-side state persists)
 
+clawk serial add <name> <device>       # a host serial port, inside the guest
+clawk serial list <name> [--json]      # forwarded ports + whether they're present
+clawk serial remove <name> <device>    # stop forwarding one
+
 clawk system info  [--json]            # host prereqs + active components
 clawk system df    [--json]            # disk usage by sandbox / cache
 clawk system prune [--image]           # reap unreferenced OCI rootfs disks
@@ -41,8 +45,8 @@ field is optional.
 
 ## Runners
 
-Built-in runners: `claude`, `codex`, `opencode`, `shell`. The dispatch
-shape is the same for all four:
+Built-in runners: `claude`, `codex`, `pi`, `opencode`, `shell`. The dispatch
+shape is the same for all five:
 
 ```sh
 clawk run <runner> [<sandbox>] [-- <runner-args>]
@@ -55,21 +59,36 @@ clawk run claude                       # cwd-sandbox
 clawk run claude foo                   # named sandbox
 clawk run claude -- --resume           # pass-through args
 clawk run codex foo -- --model o4
+clawk run pi foo -- --resume           # pi's own session picker
 clawk run shell foo                    # interactive bash
 ```
 
+The `clawk-dev` default image ships all four agents, so every name above works
+out of the box. A runner an alternative image doesn't have fails with a plain
+"command not found".
+
 Each attach starts a fresh agent process in the guest and ends when you
-disconnect; claude and codex resume from their own on-disk state next time, so
+disconnect; every runner resumes from its own on-disk state next time, so
 detaching and reattaching is cheap.
 
-State that should outlive the VM is kept on the host:
+State that should outlive the VM is kept on the host — one directory per
+runner, mounted over the guest's home:
 
-| Path on host (default namespace)                              | Mounted as            |
-|---------------------------------------------------------------|-----------------------|
-| `~/.clawk/namespaces/default/state/<name>/claude/projects/`   | `~/.claude/projects/` |
-| `~/.clawk/namespaces/default/state/<name>/claude/memory/`     | `~/.claude/memory/`   |
-| `~/.clawk/namespaces/default/state/<name>/codex/`             | `~/.codex/`           |
+| Path on host (default namespace)                            | Mounted as                  |
+|-------------------------------------------------------------|-----------------------------|
+| `~/.clawk/namespaces/default/state/<name>/claude/`          | `~/.claude/`                |
+| `~/.clawk/namespaces/default/state/<name>/codex/`           | `~/.codex/`                 |
+| `~/.clawk/namespaces/default/state/<name>/pi/`              | `~/.pi/`                    |
+| `~/.clawk/namespaces/default/state/<name>/opencode-data/`   | `~/.local/share/opencode/`  |
+| `~/.clawk/namespaces/default/state/<name>/opencode-config/` | `~/.config/opencode/`       |
 
+opencode needs two because it follows the XDG split rather than keeping one
+home directory. Its `~/.local/state/opencode` (locks) and `~/.cache/opencode`
+are deliberately left on the disposable rootfs.
+
+This is the only thing that persists a runner's sessions: the VM disk is
+re-cloned from the image on every boot, so a runner writing anywhere else
+loses its history at the next `clawk up`, not just at `clawk destroy`.
 `clawk destroy` wipes the VM disk but not the state directory, so a
 recreate returns the same conversation history.
 

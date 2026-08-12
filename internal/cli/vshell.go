@@ -68,7 +68,7 @@ returns an error rather than falling back.`,
 			Cmd:        cmdPath,
 			Args:       cmdArgs,
 			User:       sandbox.GuestUser,
-			Env:        buildVSockEnv(),
+			Env:        buildVSockEnv(sb),
 		}
 		code, err := vsockclient.Run(context.Background(), cfg)
 		if err != nil {
