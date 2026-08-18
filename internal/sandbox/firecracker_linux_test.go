@@ -39,10 +39,37 @@ func TestHasRestorableState(t *testing.T) {
 		"a state saved before the worktree had its own disk must not be trusted")
 
 	touch(f.worktreeDiskPath(sb))
+	require.False(t, f.hasRestorableState(sb, vmDir, rootfs),
+		"a state saved before sandboxes had a swap disk must not be trusted either")
+
+	touch(SwapDiskPath(vmDir))
 	require.True(t, f.hasRestorableState(sb, vmDir, rootfs), "the full disk set is present")
 
 	require.NoError(t, os.Remove(filepath.Join(vmDir, "guestcfg.img")))
 	require.False(t, f.hasRestorableState(sb, vmDir, rootfs), "guestcfg.img is attached too")
+}
+
+// A sandbox with swap disabled attaches no swap disk, so its absence must
+// not hold the restore back — the check has to track buildSpec's disk list,
+// not a fixed set.
+func TestHasRestorableStateSwapOff(t *testing.T) {
+	root := t.TempDir()
+	f := &FirecrackerProvider{store: config.NewStoreAt(root)}
+	sb := &config.Sandbox{Name: "proj", SwapMiB: -1}
+	vmDir := f.vmDir(sb)
+	rootfs := filepath.Join(vmDir, "rootfs.raw")
+
+	for _, path := range []string{
+		filepath.Join(vmDir, "suspend", "snapshot.state"),
+		rootfs,
+		filepath.Join(vmDir, "guestcfg.img"),
+		f.worktreeDiskPath(sb),
+	} {
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte("x"), 0o644))
+	}
+	require.True(t, f.hasRestorableState(sb, vmDir, rootfs),
+		"no swap disk is expected when swap is off")
 }
 
 func TestWorktreeDiskSize(t *testing.T) {

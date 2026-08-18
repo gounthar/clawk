@@ -329,3 +329,67 @@ func TestReloadForwardsErrorSurfaces(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "record vanished")
 }
+
+func TestReloadSerialsRoundTrip(t *testing.T) {
+	sock := testSocket(t)
+	var reloaded int
+	srv, err := Start(sock, Handlers{
+		Denials:       func() []netfilter.Denial { return nil },
+		Reload:        func() error { return nil },
+		ReloadSerials: func() error { reloaded++; return nil },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { srv.Close() })
+
+	require.NoError(t, NewClient(sock).ReloadSerials(context.Background()))
+	require.Equal(t, 1, reloaded)
+}
+
+// A daemon with no serial sink (firecracker, or one predating the feature)
+// must say so rather than let the CLI report a live apply that never
+// happened.
+func TestReloadSerialsUnsupported(t *testing.T) {
+	sock := testSocket(t)
+	srv, err := Start(sock, Handlers{
+		Denials: func() []netfilter.Denial { return nil },
+		Reload:  func() error { return nil },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { srv.Close() })
+
+	err = NewClient(sock).ReloadSerials(context.Background())
+	require.ErrorIs(t, err, ErrSerialUnsupported)
+}
+
+// The two reload endpoints must stay independent: a daemon that supports
+// reverse forwards but predates serial forwarding has to report exactly
+// that, not blanket success.
+func TestReloadSerialsIndependentOfReloadForwards(t *testing.T) {
+	sock := testSocket(t)
+	srv, err := Start(sock, Handlers{
+		Denials:        func() []netfilter.Denial { return nil },
+		Reload:         func() error { return nil },
+		ReloadForwards: func() error { return nil },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { srv.Close() })
+
+	c := NewClient(sock)
+	require.NoError(t, c.ReloadForwards(context.Background()))
+	require.ErrorIs(t, c.ReloadSerials(context.Background()), ErrSerialUnsupported)
+}
+
+func TestReloadSerialsErrorSurfaces(t *testing.T) {
+	sock := testSocket(t)
+	srv, err := Start(sock, Handlers{
+		Denials:       func() []netfilter.Denial { return nil },
+		Reload:        func() error { return nil },
+		ReloadSerials: func() error { return errors.New("record vanished") },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { srv.Close() })
+
+	err = NewClient(sock).ReloadSerials(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "record vanished")
+}

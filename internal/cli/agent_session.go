@@ -228,10 +228,10 @@ func tryVSockAgent(sb *config.Sandbox, provider sandbox.Provider, agent Agent, e
 	cfg := vsockclient.Config{
 		SocketPath: sockPath,
 		Cmd:        cmd,
-		Args:       append(append([]string{}, agent.DefaultArgs...), extra...),
+		Args:       launchArgs(sb, agent, extra),
 		Cwd:        agentStartDir(provider, sb),
 		User:       sandbox.GuestUser,
-		Env:        buildVSockEnv(),
+		Env:        buildVSockEnv(sb),
 		// Agents are full-screen TUIs: clear so they don't overdraw the
 		// CLI's boot narration.
 		ClearScreen: true,
@@ -271,15 +271,77 @@ func tryVSockAgent(sb *config.Sandbox, provider sandbox.Provider, agent Agent, e
 // vsock path the env must be threaded through the handshake here.
 // Loading on every dispatch picks up edits to the token file without
 // requiring a sandbox rebuild.
-func buildVSockEnv() []string {
+//
+// The sandbox's own `env ( … )` entries ride along for the same reason:
+// without them the runner process cannot see them at all, only its
+// login-shell children can. Anything that reads the environment of the
+// runner itself therefore needs this — notably `${VAR}` references in the
+// generated MCP config (see sandbox.MCPConfigFile), whose expansion
+// happens in the runner's process env, so a PAT delivered only via
+// profile.d would silently expand to empty.
+//
+// Ordering and precedence: clawk.mod entries go first and clawk's own vars
+// last, because the guest agent folds the slice into a map in order (last
+// write wins) — EXCEPT for a name the sandbox declared itself, which clawk
+// then does not emit at all.
+//
+// That exception is the whole point. clawk's defaults exist so the common
+// case works with no configuration, not to overrule a user who wrote the
+// variable down. Concretely: a sandbox pointed at a gateway that needs no
+// credential of its own (ANTHROPIC_BASE_URL, no ANTHROPIC_AUTH_TOKEN) has
+// claude fall back to CLAUDE_CODE_OAUTH_TOKEN, so clawk's injected
+// sk-ant-oat-… goes to that third-party endpoint as an Authorization
+// header — and before this, a clawk.mod declaration was silently
+// overwritten, so no config could stop it. Nobody writes
+// `CLAUDE_CODE_OAUTH_TOKEN = …` in a clawk.mod by accident, so treating it
+// as intent costs nothing. Same precedence rule as launchArgs, where the
+// user's `-- <args>` land after clawk's defaults.
+//
+// A declared-but-empty value is emitted as empty rather than dropped, so
+// it still shadows whatever the image or a parent process might have set.
+// Note that empty is not the same as absent: the guest agent folds these
+// into a map (agentembed/main.go.in, buildChildEnv), so `NAME=` reaches the
+// child set-but-empty. Whether that reads as "unset" is the consumer's
+// call — claude treats an empty credential as unset, but not every program
+// does, and clawk has no way to express a true unset today.
+//
+// Resolution here is best-effort by design: attach is the hot path and
+// must not become unusable because a variable left the host shell since
+// create (the guest still has the value profile.d captured then). A
+// failure warns and the remaining entries still go through — but the
+// failing name stays suppressed, because the alternative is clawk quietly
+// re-injecting the credential the declaration existed to displace.
+func buildVSockEnv(sb *config.Sandbox) []string {
 	env := []string{}
+	modEnv, err := sandbox.ResolveEnv(sb)
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"warning: some clawk.mod env vars could not be resolved for "+
+				"sandbox %q; the agent process will not see them: %v\n",
+			sb.DisplayName(), err)
+	}
+	env = append(env, modEnv...)
+
+	// Names the sandbox set for itself; clawk yields on every one of them.
+	//
+	// Taken from the declarations, NOT from modEnv: an entry that failed to
+	// resolve is still a name the user spoke for, and reading it back out of
+	// the resolved set would hand it to clawk again — see
+	// sandbox.DeclaredEnvNames.
+	declared := sandbox.DeclaredEnvNames(sb)
+	add := func(k, v string) {
+		if !declared[k] {
+			env = append(env, k+"="+v)
+		}
+	}
+
 	if tok, _ := sandbox.LoadOAuthToken(clawkRoot()); tok != "" {
-		env = append(env, "CLAUDE_CODE_OAUTH_TOKEN="+tok)
+		add("CLAUDE_CODE_OAUTH_TOKEN", tok)
 	}
 	if v := os.Getenv("COLORTERM"); v != "" {
-		env = append(env, "COLORTERM="+v)
+		add("COLORTERM", v)
 	} else {
-		env = append(env, "COLORTERM=truecolor")
+		add("COLORTERM", "truecolor")
 	}
 	// Forward terminal-identification env vars verbatim. Empty values
 	// are dropped — we don't want to claim "I'm iTerm2" when the user
@@ -293,14 +355,14 @@ func buildVSockEnv() []string {
 		"ITERM_PROFILE",        // ditto
 	} {
 		if v := os.Getenv(k); v != "" {
-			env = append(env, k+"="+v)
+			add(k, v)
 		}
 	}
 	if v := os.Getenv("LANG"); v != "" {
-		env = append(env, "LANG="+v)
+		add("LANG", v)
 	}
 	if v := os.Getenv("LC_ALL"); v != "" {
-		env = append(env, "LC_ALL="+v)
+		add("LC_ALL", v)
 	}
 	return env
 }
@@ -321,7 +383,7 @@ func attachAgentViaExec(sb *config.Sandbox, provider sandbox.Provider, agent Age
 	if !ok {
 		return fmt.Errorf("provider for %q cannot exec the agent", sb.Name)
 	}
-	defaults := strings.Join(quoteAll(agent.DefaultArgs), " ")
+	defaults := strings.Join(quoteAll(launchArgs(sb, agent, nil)), " ")
 	cmdline := `: "${TERM:=xterm-256color}"; : "${COLORTERM:=truecolor}"; ` +
 		"export TERM COLORTERM; " +
 		"cd " + agentStartDir(provider, sb) + " 2>/dev/null || true; " +

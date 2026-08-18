@@ -22,7 +22,7 @@ prompt every few seconds), or you run `--dangerously-skip-permissions` and hope
 nothing important is one `rm -rf` or one leaked token away.
 
 clawk is a third option. `cd` into a repo, type `clawk`, and Claude Code (or
-Codex, or a shell) is working inside a disposable Linux VM (your code mounted
+Codex, or pi, or a shell) is working inside a disposable Linux VM (your code mounted
 in, root in the guest, no permission prompts) while your files, your keychain,
 and the rest of your machine stay out of reach. **The agent gets its own
 machine instead of yours.**
@@ -156,7 +156,7 @@ The everyday case, a sandbox for the directory you're in:
 cd ~/code/my-project
 clawk                      # boot a sandbox for this dir + attach claude
 clawk run shell            # drop into a shell in the same sandbox
-clawk run codex            # or another agent: codex, opencode, shell
+clawk run codex            # or another agent: codex, pi, opencode, shell
 clawk down                 # stop the VM (repo + agent state persist)
 clawk attach               # come back later — boots if stopped, reattaches claude
 clawk destroy              # remove the VM (conversation history is kept)
@@ -196,7 +196,7 @@ lives on the host.*
 | | `clawk down` | `clawk destroy` |
 | --- | :---: | :---: |
 | Your repo (mounted worktree; commits, branches) | ✅ | ✅ |
-| Agent state (Claude/Codex conversations, memory) | ✅ | ✅ |
+| Agent state (Claude/Codex/pi/opencode conversations, memory) | ✅ | ✅ |
 | The VM disk (apt installs, caches, `$HOME`) | ❌ (rebuilt fresh at every boot*) | ❌ (that's the point) |
 
 \* Two exceptions: resuming a `clawk snapshot` restores the disk and
@@ -204,16 +204,23 @@ memory exactly as suspended, and the Linux/firecracker provider keeps
 its disk until destroy. Tools every boot needs belong in the image
 (`vm ( image … )`); per-boot setup belongs in `on up` hooks.
 
-Agent state is host-mounted per sandbox: the guest's `~/.claude/projects/`
-and `~/.claude/memory/` (and codex's `~/.codex/`) live under
+Agent state is host-mounted per sandbox: each runner's home directory —
+claude's `~/.claude/`, codex's `~/.codex/`, pi's `~/.pi/`, opencode's two XDG
+dirs — live under
 `~/.clawk/namespaces/default/state/<name>/` on the host, so a recreated
-sandbox picks up its old conversations with `--resume`.
+sandbox picks up its old conversations with `--resume`. That mount is what
+makes the promise real: the VM disk itself is re-cloned from the image on
+every boot, so anything a runner writes outside those directories is gone
+at the next `clawk up`.
 
 ## Full autonomy by default (and the `--safe` opt-out)
 
 Runners launch in their "externally sandboxed" modes: claude gets
 `--dangerously-skip-permissions`, codex gets
-`--dangerously-bypass-approvals-and-sandbox`. On your own machine those flags
+`--dangerously-bypass-approvals-and-sandbox`, pi gets `--approve` (it has no
+approval prompts to bypass — it ships no sandbox at all — but it does gate
+project-local `.pi/` settings and extensions behind a trust prompt), and
+opencode gets `--auto`. On your own machine those flags
 would be reckless; here they are the point: the VM boundary and the network
 allow-list provide the containment, so the agent works at full speed without
 per-action prompts. The agent can only affect what you mounted and
@@ -261,6 +268,9 @@ sandbox my-project (
     forwards ( 3000 )
     env ( DATABASE_URL )            # forward a host var; values come from your shell
     # also: GH=${OTHER_NAME}, LOG=${LOG:-info} defaults, API=${API:?required}
+    mcp (                           # MCP servers, ready on first boot
+        linear https://mcp.linear.app/mcp header "Authorization: Bearer ${LINEAR_TOKEN}"
+    )
     on create ( "go mod download" )
     agent (
         instructions "Ask before running destructive commands."
@@ -271,8 +281,11 @@ sandbox my-project (
 The block is a *template*: snapshotted when the sandbox is created, so a
 running sandbox never changes unexpectedly. The full reference (shares,
 secret files, skills, agent memory seeding, multi-repo workspace roots) is
-in **[docs/configuration.md](docs/configuration.md)**; images and custom
-guest kernels (including the KVM-enabled kernel used for nested
+in **[docs/configuration.md](docs/configuration.md)**; MCP servers and how
+their credentials stay off disk are in **[docs/mcp.md](docs/mcp.md)**;
+putting a USB-serial board from your Mac inside the sandbox for
+microcontroller work is in **[docs/serial.md](docs/serial.md)**; images
+and custom guest kernels (including the KVM-enabled kernel used for nested
 virtualization) are in **[docs/images.md](docs/images.md)**.
 
 ## Lifecycle
@@ -304,7 +317,7 @@ you ──▶ clawk CLI ──▶ per-sandbox daemon (detached; owns the VM)
                         └─ VM: Virtualization.framework (macOS) / firecracker (Linux)
                              ├─ clawk-init, PID 1 (no systemd, no cloud-init)
                              ├─ your repo, live-mounted over virtio-fs
-                             └─ claude / codex / shell on a PTY
+                             └─ claude / codex / pi / shell on a PTY
 ```
 
 A few deliberate choices, in brief:

@@ -57,7 +57,8 @@ type PolicyDef struct {
 }
 
 // NamespaceDef is one `namespace <name> ( ... )` block: a named overlay of
-// the per-namespace template subset (network / files / shares / env / agent).
+// the per-namespace template subset (network / files / shares / mcp / env /
+// agent).
 // VM shape, includes and lifecycle hooks are sandbox-level concerns and are
 // rejected inside a namespace body.
 type NamespaceDef struct {
@@ -373,6 +374,8 @@ func (p *parser) parseNamespaceBlock() (NamespaceDef, error) {
 			err = p.parseFilesBlock(def.Template)
 		case "shares":
 			err = p.parseSharesBlock(def.Template)
+		case "mcp":
+			err = p.parseMCPBlock(def.Template)
 		case "env":
 			err = p.parseEnvBlock(&def.Template.Env)
 		case "agent":
@@ -380,11 +383,11 @@ func (p *parser) parseNamespaceBlock() (NamespaceDef, error) {
 		case "vm", "includes", "on":
 			err = p.errorAt(t,
 				"%q is a sandbox-level directive, not allowed in a namespace (want %s)",
-				t.Val, describeFirst([]string{"network", "files", "shares", "env", "agent"}))
+				t.Val, describeFirst([]string{"network", "files", "shares", "mcp", "env", "agent"}))
 		default:
 			err = p.errorAt(t,
 				"unknown 'namespace' directive %q (want %s)", t.Val,
-				describeFirst([]string{"network", "files", "shares", "env", "agent"}))
+				describeFirst([]string{"network", "files", "shares", "mcp", "env", "agent"}))
 		}
 		if err != nil {
 			return def, err

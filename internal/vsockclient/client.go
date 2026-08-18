@@ -65,7 +65,7 @@ type Config struct {
 	User string
 
 	// ClearScreen asks Run to clear the terminal before relaying, so a
-	// full-screen TUI child (claude, codex, opencode) starts on a clean
+	// full-screen TUI child (claude, codex, pi, opencode) starts on a clean
 	// canvas instead of overdrawing whatever the CLI printed first (boot
 	// progress, hints): such TUIs position with absolute cursor moves and
 	// don't erase the cells they skip, so stale text shows through.

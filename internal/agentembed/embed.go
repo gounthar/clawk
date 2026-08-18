@@ -54,3 +54,12 @@ var InitMainGo []byte
 //
 //go:embed init_go.mod.in
 var InitGoMod []byte
+
+// SerialAgentTest is the agent's own test suite for the serial forwarder,
+// run inside a throwaway module built from AgentMainGo — see
+// TestSerialForwarderRuns. Embedded rather than kept as a normal _test.go
+// for the same reason main.go.in is: it is package main in the guest's
+// module, not in this one.
+//
+//go:embed serial_agent_test.go.in
+var SerialAgentTest []byte

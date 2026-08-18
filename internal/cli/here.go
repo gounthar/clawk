@@ -157,7 +157,13 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 		return sb, false, nil
 	}
 
-	clawkfile, policies := loadHereClawkfile(cwd)
+	clawkfile, policies, globalPath, err := loadHereClawkfile(cwd)
+	if err != nil {
+		return nil, false, err
+	}
+	if globalPath != "" {
+		fmt.Printf("Using host-wide defaults from %s\n", globalPath)
+	}
 
 	// Register the file's `policy <name> ( ... )` blocks before composing
 	// the network policy — `use` references resolve against the store at
@@ -187,6 +193,8 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 	var memory string
 	var fileSources []fileSource
 	var shareSources []shareSource
+	var serialSources []serialSource
+	var mcpSources []mcpSource
 	if clawkfile != nil {
 		forwardSpecs = append(forwardSpecs, clawkfile.Forwards...)
 		reverseForwardSpecs = append(reverseForwardSpecs, clawkfile.ReverseForwards...)
@@ -209,6 +217,12 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 		for _, s := range clawkfile.Shares {
 			shareSources = append(shareSources, shareSource{Origin: "clawk.mod", Spec: s})
 		}
+		for _, s := range clawkfile.Serials {
+			serialSources = append(serialSources, serialSource{Origin: "clawk.mod", Spec: s})
+		}
+		for _, s := range clawkfile.MCP {
+			mcpSources = append(mcpSources, mcpSource{Origin: "clawk.mod", Spec: s})
+		}
 	}
 
 	forwards, err := parseForwardSpecs(forwardSpecs, cwd)
@@ -227,18 +241,27 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+	serials, err := composeSerials(serialSources)
+	if err != nil {
+		return nil, false, err
+	}
+	mcpServers, err := composeMCP(mcpSources)
+	if err != nil {
+		return nil, false, err
+	}
 
 	var nested bool
 	var cpu uint
 	var memoryMiB, memoryMaxMiB, diskMiB uint64
 	var image, kernel string
-	var idleTimeoutSec int64
+	var idleTimeoutSec, swapMiB int64
 	if clawkfile != nil {
 		nested = clawkfile.Nested
 		cpu = clawkfile.CPU
 		memoryMiB = clawkfile.MemoryMiB
 		memoryMaxMiB = clawkfile.MemoryMaxMiB
 		diskMiB = clawkfile.DiskMiB
+		swapMiB = clawkfile.SwapMiB
 		image = clawkfile.Image
 		kernel = clawkfile.Kernel
 		idleTimeoutSec = clawkfile.IdleTimeoutSec
@@ -265,6 +288,8 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 		ReverseForwards: reverseForwards,
 		Files:           files,
 		Shares:          shares,
+		Serials:         serials,
+		MCP:             mcpServers,
 		RequiredEnv:     requiredEnv,
 		Instructions:    instructions,
 		Memory:          memory,
@@ -273,6 +298,7 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 		MemoryMiB:       memoryMiB,
 		MemoryMaxMiB:    memoryMaxMiB,
 		DiskMiB:         diskMiB,
+		SwapMiB:         swapMiB,
 		// IdleTimeoutSec rides the same snapshot-at-create rule as every
 		// other clawk.mod value; it was the one vm(...) field this path
 		// forgot to copy when idle-stop landed, which silently pinned every
@@ -295,6 +321,8 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 		}},
 		CreatedAt: time.Now(),
 	}
+	// Derived MCP egress, before the first Save — see applyMCPNetwork.
+	applyMCPNetwork(sb)
 	if err := store.Save(sb); err != nil {
 		return nil, false, fmt.Errorf("saving sandbox: %w", err)
 	}
@@ -302,21 +330,44 @@ func loadOrCreateHereSandbox(name, cwd string) (*config.Sandbox, bool, error) {
 }
 
 // loadHereClawkfile reads cwd/clawk.mod if present and returns its sandbox
-// template plus any policy blocks declared beside it. Missing or unreadable
-// clawk.mod is not an error — callers fall back to defaults.
-func loadHereClawkfile(cwd string) (*template.Template, []template.PolicyDef) {
+// template — with the host-wide clawk.mod folded in underneath — plus any
+// policy blocks declared beside either, and the host-wide file's path for the
+// create-time note. Missing or unreadable clawk.mod is not an error: callers
+// fall back to defaults, which is where the host-wide layer alone lands.
+//
+// A broken host-wide layer IS an error, and it has to be, for the same reason
+// resolveSource surfaces it: the standalone loader fails as a whole, so
+// degrading to "no defaults" here would throw away the repo's OWN clawk.mod
+// too — its forwards, env and instructions — and create the sandbox anyway
+// with nothing but a line on stderr to say so. See template.ErrGlobalMod.
+func loadHereClawkfile(cwd string) (*template.Template, []template.PolicyDef, string, error) {
 	ws, err := template.LoadStandaloneClawkfileWithProfile(cwd, "")
 	if err != nil {
+		// The host-wide layer carries its own context, so it is not prefixed
+		// with a clawk.mod the user may not even have.
+		if errors.Is(err, template.ErrGlobalMod) {
+			return nil, nil, "", err
+		}
 		// Only surface non-ENOENT errors; absence is expected.
 		if !errors.Is(err, os.ErrNotExist) {
 			fmt.Fprintf(os.Stderr, "warning: reading clawk.mod: %v\n", err)
+			return nil, nil, "", nil
 		}
-		return nil, nil
+		// No clawk.mod here — the host-wide defaults are the whole template.
+		// The standalone loader never got far enough to fold them in.
+		g, gerr := template.LoadGlobal()
+		if gerr != nil {
+			if !errors.Is(gerr, template.ErrNoGlobalMod) {
+				return nil, nil, "", gerr
+			}
+			return nil, nil, "", nil
+		}
+		return g.Template, g.Policies, g.Path, nil
 	}
 	if ws == nil || len(ws.Repos) == 0 {
-		return nil, nil
+		return nil, nil, "", nil
 	}
-	return ws.Repos[0].Clawkfile, ws.Policies
+	return ws.Repos[0].Clawkfile, ws.Policies, ws.GlobalPath, nil
 }
 
 // parseForwardSpecs turns a list of "PORT" or "HOST:GUEST" strings into

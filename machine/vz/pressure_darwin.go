@@ -199,6 +199,12 @@ func (v *vm) runBalloonController(ctx context.Context, dev *codevz.VirtioTraditi
 	level := pressureNormal
 	var rep memReport
 	var lastReport time.Time
+	// Swap occupancy needs history to mean anything, so the trend is folded
+	// once per arriving report and its verdict held until the next one — the
+	// same lifetime as rep itself. Re-observing on a tick would see the same
+	// numbers, count them as quiet, and decay the hold in seconds.
+	var swap swapTrend
+	var swapPressure bool
 
 	debug.Log("vz", "balloon controller started", "id", v.spec.ID,
 		"baseline_mib", baseline/(1024*1024), "ceiling_mib", ceiling/(1024*1024),
@@ -213,7 +219,7 @@ func (v *vm) runBalloonController(ctx context.Context, dev *codevz.VirtioTraditi
 		if fresh {
 			// Guest reported, so its balloon driver is up: manage between
 			// baseline and ceiling on demand.
-			target = mergedBalloonTarget(level, cur, baseline, ceiling, rep)
+			target = mergedBalloonTarget(level, cur, baseline, ceiling, rep, swapPressure)
 		} else {
 			// No fresh report — guest still booting, image has no reporter, or
 			// the agent died. Don't try to inflate: a target set before the
@@ -235,7 +241,11 @@ func (v *vm) runBalloonController(ctx context.Context, dev *codevz.VirtioTraditi
 		debug.Log("vz", "balloon apply", "id", v.spec.ID, "trigger", trigger,
 			"level", level.String(), "target_mib", target/(1024*1024),
 			"fresh_report", fresh, "changed", changed,
-			"guest_avail_mib", rep.AvailableKiB/1024, "guest_psi_centi", rep.PSIMemSomeCenti)
+			"guest_avail_mib", rep.AvailableKiB/1024, "guest_psi_centi", rep.PSIMemSomeCenti,
+			// Logged because "why is this guest not shrinking?" is otherwise
+			// unanswerable from the outside: the hold looks identical to the
+			// hysteresis band.
+			"guest_swap_used_mib", rep.SwapUsedKiB()/1024, "swap_pressure", swapPressure)
 	}
 
 	apply("init")
@@ -248,6 +258,7 @@ func (v *vm) runBalloonController(ctx context.Context, dev *codevz.VirtioTraditi
 			apply("pressure")
 		case rep = <-reports:
 			lastReport = time.Now()
+			swapPressure = swap.observe(rep)
 			apply("report")
 		case <-t.C:
 			apply("tick")

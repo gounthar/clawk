@@ -215,6 +215,21 @@ func ensureRuntimeMounts(provider sandbox.Provider, sb *config.Sandbox) error {
 			}
 		}
 	}
+	// Per-sandbox agent state (~/.claude, ~/.codex, ~/.pi). Normally the
+	// boot manifest has these mounted already and every call here is a
+	// `mountpoint -q` no-op — but clawk-init only LOGS a failed host-share
+	// mount and carries on booting, and a runner whose home didn't mount
+	// writes to the rootfs vz re-clones next boot, i.e. loses its history
+	// with no error anywhere the user looks. Cheap retry, expensive miss.
+	//
+	// Mounted BEFORE DefaultHostShares: its capability dirs are sub-mounts
+	// inside these homes (~/.claude/agents, ~/.codex/skills), and a parent
+	// mounted afterwards would shadow them.
+	for _, sh := range sandbox.PersistentAgentShares(store.StateDir(sb.Name)) {
+		if err := mountIfMissing(sp, sb, sh.Tag, sh.GuestPath); err != nil {
+			return fmt.Errorf("%s: %w", sh.GuestPath, err)
+		}
+	}
 	for _, sh := range sandbox.DefaultHostShares() {
 		if err := mountIfMissing(sp, sb, sh.Tag, sh.GuestPath); err != nil {
 			return fmt.Errorf("%s: %w", sh.GuestPath, err)

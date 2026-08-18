@@ -47,9 +47,41 @@ type Manifest struct {
 	Hostname string    `json:"hostname,omitempty"`
 	Network  *Network  `json:"network,omitempty"`
 	User     *User     `json:"user,omitempty"`
+	Swap     *Swap     `json:"swap,omitempty"`
 	Mounts   []Mount   `json:"mounts,omitempty"`
 	Files    []File    `json:"files,omitempty"`
 	Services []Service `json:"services,omitempty"`
+}
+
+// Swap is the guest's swap device: a sparse virtio-blk disk the host
+// attaches and clawk-init formats and enables at boot. Nil means the
+// sandbox runs without swap.
+//
+// A dedicated device rather than a swapfile on the rootfs, because
+// swapon(2) rejects a file with holes: a 4 GiB swapfile would cost 4 GiB
+// of real host bytes at first boot, per sandbox. A block device has no
+// such rule, so the backing file stays sparse and only materializes the
+// pages actually swapped.
+//
+// Why swap at all: the balloon controller (machine/vz) reclaims guest RAM
+// under host memory pressure, against guest demand — see mergedBalloonTarget.
+// With nowhere to put anonymous pages the guest answers that with direct
+// reclaim stalls and, at the limit, its OOM killer. Multi-second stalls in
+// the agent process are what turn a marginal network link into dropped API
+// streams, since a stalled process stops draining its socket.
+//
+// Additive like Mount.Block — an older clawk-init ignores the field and
+// boots without swap, so this needs no Version bump.
+type Swap struct {
+	// Device is the in-guest block device path (e.g. "/dev/vdc"). The
+	// provider owns the ordering that produces it: disks are attached
+	// rootfs-first, then Spec.Disks in order.
+	Device string `json:"device"`
+
+	// Swappiness sets vm.swappiness when non-zero. Zero leaves the kernel
+	// default (60) alone — it is not a way to say "never swap", which is
+	// what a literal swappiness of 0 would mean.
+	Swappiness int `json:"swappiness,omitempty"`
 }
 
 // Network is the static interface configuration. gvproxy assigns a fixed

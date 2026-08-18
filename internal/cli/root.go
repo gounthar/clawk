@@ -135,7 +135,15 @@ func init() {
 		"OCI image for new sandboxes (registry ref or docker-save tarball path; overrides clawk.mod)")
 	rootCmd.PersistentFlags().StringVar(&kernelFlag, "kernel", "",
 		"guest kernel override for new sandboxes (local vmlinux path or http(s) URL; overrides clawk.mod). Default: the Kata kernel")
+	rootCmd.PersistentFlags().BoolVar(&noGlobalFlag, "no-global", false,
+		"ignore the host-wide clawk.mod (~/.config/clawk/clawk.mod) — the repo's own config only, for a reproducible run")
 }
+
+// noGlobalFlag (--no-global) drops the host-wide defaults layer. It exists
+// because that file makes a sandbox's shape depend on host-local config: a CI
+// run or a bug report needs a way to say "just what's in the repo". Applied in
+// PersistentPreRunE (see setup.go), before any template load.
+var noGlobalFlag bool
 
 // testProvider, if non-nil, is returned from providerFor — used by tests to
 // inject a MockProvider without going through provider selection.

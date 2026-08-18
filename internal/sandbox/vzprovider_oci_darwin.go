@@ -114,6 +114,13 @@ func (v *VZProvider) createOCI(sb *config.Sandbox) error {
 	if err := SeedClaudeStateDir(v.store.StateDir(sb.Name), v.store.RootDir()); err != nil {
 		return fmt.Errorf("seeding claude state dir: %w", err)
 	}
+	// Declared MCP servers, rendered before boot so the runner's first
+	// connection attempt already has them. Fatal, unlike the memory seed
+	// below: a sandbox that silently comes up without the servers its
+	// clawk.mod asked for is the failure this whole path exists to avoid.
+	if err := SeedClaudeMCP(v.store.StateDir(sb.Name), sb.MCP); err != nil {
+		return fmt.Errorf("seeding mcp config: %w", err)
+	}
 	// Seed baseline auto-memory once (no-op if the sandbox already has memory,
 	// e.g. a re-create whose state dir survived). Best-effort: never block boot.
 	if err := SeedClaudeMemory(v.store.StateDir(sb.Name), sb.Memory); err != nil {

@@ -21,12 +21,14 @@ const agentMemPort uint32 = 1027
 
 // memReport wire sizes. The report grew from three to five big-endian
 // uint64s when the guest agent started sampling activity (load, net I/O)
-// alongside memory. Decoding accepts the legacy 24-byte prefix alone so a
-// new host reads an old guest's report (and vice versa: an old host's
-// fixed 24-byte read simply ignores the tail a new guest appends).
+// alongside memory, and to seven when sandboxes gained a swap device.
+// Decoding accepts any of the three lengths, so a new host reads an old
+// guest's report (and vice versa: an old host's fixed read simply ignores
+// the tail a new guest appends).
 const (
-	memReportLegacySize = 24
-	memReportSize       = 40
+	memReportLegacySize   = 24
+	memReportActivitySize = 40
+	memReportSize         = 56
 )
 
 // memReport is a guest snapshot. The balloon controller polls the memory
@@ -63,10 +65,31 @@ type memReport struct {
 	// samples: moving counters mean traffic is flowing.
 	NetIOBytes uint64
 
+	// SwapTotalKiB and SwapFreeKiB mirror /proc/meminfo's SwapTotal and
+	// SwapFree. Both zero on a guest with no swap device — and equally on a
+	// guest agent too old to report them, which is why the controller only
+	// ever reads them as "swap is in use", never as "swap is not in use".
+	//
+	// They exist because AvailableKiB alone stops describing demand once a
+	// guest can swap: pushing cold anonymous pages out raises MemAvailable
+	// and lowers PSI, so a guest under real pressure can look idle. See
+	// guestDesiredTarget.
+	SwapTotalKiB uint64
+	SwapFreeKiB  uint64
+
 	// HasActivity reports whether the guest agent is new enough to include
 	// the activity fields (Load1Centi, NetIOBytes). When false those fields
 	// are zero because they're absent, not because the guest is quiet.
 	HasActivity bool
+}
+
+// SwapUsedKiB is the swap the guest has actually written. Zero when the
+// guest has no swap, reports none, or has swapped nothing.
+func (r memReport) SwapUsedKiB() uint64 {
+	if r.SwapTotalKiB == 0 || r.SwapFreeKiB > r.SwapTotalKiB {
+		return 0
+	}
+	return r.SwapTotalKiB - r.SwapFreeKiB
 }
 
 // encodeMemReport serializes r into exactly memReportSize bytes.
@@ -77,6 +100,8 @@ func encodeMemReport(r memReport) []byte {
 	binary.BigEndian.PutUint64(b[16:24], r.PSIMemSomeCenti)
 	binary.BigEndian.PutUint64(b[24:32], r.Load1Centi)
 	binary.BigEndian.PutUint64(b[32:40], r.NetIOBytes)
+	binary.BigEndian.PutUint64(b[40:48], r.SwapTotalKiB)
+	binary.BigEndian.PutUint64(b[48:56], r.SwapFreeKiB)
 	return b
 }
 
@@ -94,10 +119,14 @@ func decodeMemReport(b []byte) (memReport, error) {
 		AvailableKiB:    binary.BigEndian.Uint64(b[8:16]),
 		PSIMemSomeCenti: binary.BigEndian.Uint64(b[16:24]),
 	}
-	if len(b) >= memReportSize {
+	if len(b) >= memReportActivitySize {
 		r.Load1Centi = binary.BigEndian.Uint64(b[24:32])
 		r.NetIOBytes = binary.BigEndian.Uint64(b[32:40])
 		r.HasActivity = true
+	}
+	if len(b) >= memReportSize {
+		r.SwapTotalKiB = binary.BigEndian.Uint64(b[40:48])
+		r.SwapFreeKiB = binary.BigEndian.Uint64(b[48:56])
 	}
 	return r, nil
 }
@@ -111,6 +140,8 @@ type GuestStats struct {
 	PSIMemSomeCenti uint64
 	Load1Centi      uint64
 	NetIOBytes      uint64
+	SwapTotalKiB    uint64
+	SwapFreeKiB     uint64
 
 	// HasActivity is false when the guest runs a legacy agent without the
 	// activity fields; Load1Centi and NetIOBytes are then meaningless.
@@ -151,6 +182,8 @@ func FetchGuestStats(ctx context.Context, m machine.Machine) (GuestStats, error)
 		PSIMemSomeCenti: r.PSIMemSomeCenti,
 		Load1Centi:      r.Load1Centi,
 		NetIOBytes:      r.NetIOBytes,
+		SwapTotalKiB:    r.SwapTotalKiB,
+		SwapFreeKiB:     r.SwapFreeKiB,
 		HasActivity:     r.HasActivity,
 	}, nil
 }

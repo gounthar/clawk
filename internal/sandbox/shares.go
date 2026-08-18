@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -60,61 +61,124 @@ type HostFile struct {
 	Owner     string // "user:group" or "" for root
 }
 
-// PersistentClaudeShares returns the per-sandbox host share that
-// carries Claude Code's entire ~/.claude/ across destroy/recreate
-// cycles. Call sites already resolved a Store so they pass the state
-// root directly rather than re-deriving the path.
+// AgentStateDir maps one coding-agent runner's home directory onto the
+// per-sandbox host storage that backs it. See AgentStateDirs.
+type AgentStateDir struct {
+	// Agent is the runner name in the CLI's agent registry, purely for
+	// documentation and error messages.
+	Agent string
+	// Sub is the subdirectory under the sandbox's state root.
+	Sub string
+	// Tag is the virtio-fs tag; unique across every share on one VM.
+	Tag string
+	// GuestPath is where the runner looks for its state inside the VM.
+	GuestPath string
+}
+
+// AgentStateDirs lists the runner home directories clawk persists per
+// sandbox. Every entry is one virtio-fs device, so the list is the
+// contract both the device side (cli.collectSandboxShares) and the guest
+// manifest (OCIGuestManifest) iterate.
 //
-// The host directory is created idempotently so virtiofs never
-// encounters a missing source. The guest-side mount point is
-// ~/.claude/ — per-sandbox storage that does NOT suffer the shared-
-// .claude.json races documented below; two sandboxes can't touch
-// the same path because each sandbox name maps to a distinct host
-// dir.
+// Why each runner needs one: the vz rootfs is re-cloned from the image on
+// EVERY boot (see suspendBootRootFS — a per-boot-disposable disk is the
+// design), so anything a runner writes under $HOME on the rootfs is gone
+// after a plain `clawk down && clawk up`, never mind a destroy. Claude
+// survived that because its ~/.claude was mounted from the host; codex's
+// sessions, history, and login did not, so every restart looked like a
+// fresh install. Persisting each runner's home dir is what makes the
+// documented "conversation memory persists across destroys" promise true
+// for more than one runner.
 //
-// We mount the whole dir rather than a curated subdir list because:
+// Guest paths, all whole-home mounts rather than curated subdir lists —
+// the ephemeral parts (caches, logs) measure in hundreds of KB and
+// excluding them isn't worth the bookkeeping:
 //
-//   - The "ephemeral" subdirs (cache/, paste-cache/, shell-snapshots/,
-//     telemetry/) measure in hundreds of KB total — exclusion isn't
-//     worth the bookkeeping.
-//   - settings.json and CLAUDE.md, formerly snapshot HostFiles, are
-//     now seeded via SeedClaudeStateDir straight into the synced
-//     dir before the mount happens. That removes the snapshot-file
-//     vs share-mount layering issue.
-//   - .credentials.json (non-token path) lives at its canonical place
-//     inside the synced dir, so claude's atomic write-rename refresh
-//     persists naturally — no more copy-in/copy-out trick via
-//     auth/credentials.json.
+//	claude  ~/.claude       projects/, memory/, settings.json, .credentials.json
+//	codex   ~/.codex        sessions/, history.jsonl, auth.json, config.toml
+//	pi      ~/.pi           agent/{sessions,settings.json,auth.json,trust.json}
 //
-// Mount ordering: this share must come BEFORE DefaultHostShares in
-// the assembled share list. The agents/commands sub-mounts land on
-// top of ~/.claude/ at boot, and Linux would shadow them under a
-// later parent mount.
+// opencode is the one runner that needs two, because it follows the XDG
+// split rather than keeping a single home (verified with `opencode debug
+// paths`, which is the authority for its layout):
 //
-// Cross-sandbox races (the ones DefaultHostShares is avoiding) don't
-// apply here — each sandbox name maps to its own state dir, so two
-// sandboxes never write to the same path.
+//	opencode  ~/.local/share/opencode  auth.json, mcp-auth.json, opencode.db, repos/
+//	opencode  ~/.config/opencode       opencode.jsonc
+//
+// Its other two XDG dirs are deliberately left on the disposable rootfs.
+// ~/.local/state/opencode holds only locks/, and a lock that outlives the
+// VM it was taken in is worse than no lock at all — a hard stop would
+// leave one behind for the next boot to trip over. ~/.cache/opencode is a
+// cache by name and contract; the only real cost is re-downloading
+// cache/bin per sandbox, which is the same trade the toolchain caches make
+// (see ToolchainCachesEnabled).
+//
+// Cost note: every entry here is a PCIe device on every sandbox, against
+// the ceiling documented in machine/vz (32, with a field-confirmed failure
+// at 34). Five entries plus the workspace, the per-repo aliases, and the
+// default capability shares still leaves room for a normal multi-repo
+// sandbox, but this list is not free to extend — a sixth runner wanting
+// three dirs is where the consolidation trick (one mount plus a
+// dir-override env var, e.g. OPENCODE_CONFIG_DIR) starts paying for its
+// complexity.
+var AgentStateDirs = []AgentStateDir{
+	{Agent: "claude", Sub: "claude", Tag: "claude_home", GuestPath: GuestHome + "/.claude"},
+	{Agent: "codex", Sub: "codex", Tag: "codex_home", GuestPath: GuestHome + "/.codex"},
+	{Agent: "pi", Sub: "pi", Tag: "pi_home", GuestPath: GuestHome + "/.pi"},
+	{Agent: "opencode", Sub: "opencode-data", Tag: "opencode_data",
+		GuestPath: GuestHome + "/.local/share/opencode"},
+	{Agent: "opencode", Sub: "opencode-config", Tag: "opencode_config",
+		GuestPath: GuestHome + "/.config/opencode"},
+}
+
+// PersistentAgentShares returns the per-sandbox host shares that carry
+// each coding agent's home directory across down/up and destroy/recreate
+// cycles. Call sites already resolved a Store so they pass the state root
+// directly rather than re-deriving the path.
+//
+// Host directories are created idempotently so virtiofs never encounters
+// a missing source; a directory that can't be created drops its share
+// rather than failing sandbox creation, matching ToolchainCacheShares.
+// The guest mount points are per-sandbox storage, so they do NOT suffer
+// the shared-state races documented on DefaultHostShares — two sandboxes
+// can't touch the same path because each sandbox name maps to a distinct
+// host dir.
+//
+// For claude specifically, the whole-dir mount is also what lets
+// settings.json, CLAUDE.md and .credentials.json be seeded straight into
+// the synced dir by SeedClaudeStateDir before the mount happens (no
+// snapshot-file vs share-mount layering issue), and lets claude's atomic
+// write-rename credential refresh persist naturally.
+//
+// Mount ordering: these shares must come BEFORE DefaultHostShares in the
+// assembled share list. Its sub-mounts land INSIDE these homes
+// (~/.claude/agents, ~/.claude/commands, ~/.codex/skills), and Linux
+// would shadow them under a later parent mount.
 //
 // Opt out by passing an empty stateRoot.
-func PersistentClaudeShares(stateRoot string) []HostShare {
+func PersistentAgentShares(stateRoot string) []HostShare {
 	if stateRoot == "" {
 		return nil
 	}
-	hostPath := filepath.Join(stateRoot, "claude")
-	if err := os.MkdirAll(hostPath, 0o755); err != nil {
-		return nil
+	out := make([]HostShare, 0, len(AgentStateDirs))
+	for _, d := range AgentStateDirs {
+		hostPath := filepath.Join(stateRoot, d.Sub)
+		if err := os.MkdirAll(hostPath, 0o755); err != nil {
+			continue
+		}
+		out = append(out, HostShare{
+			HostPath:  hostPath,
+			Tag:       d.Tag,
+			GuestPath: d.GuestPath,
+			ReadOnly:  false,
+		})
 	}
-	return []HostShare{{
-		HostPath:  hostPath,
-		Tag:       "claude_home",
-		GuestPath: GuestHome + "/.claude",
-		ReadOnly:  false,
-	}}
+	return out
 }
 
 // SeedClaudeStateDir writes the host-snapshot files (settings.json,
 // CLAUDE.md, .credentials.json) directly into the per-sandbox state dir that
-// PersistentClaudeShares mounts at ~/.claude/. Run by the provider
+// PersistentAgentShares mounts at ~/.claude/. Run by the provider
 // during sandbox preparation, BEFORE the VM boots — so by the time
 // virtio-fs mounts the dir, the files are already in place.
 //
@@ -188,7 +252,7 @@ func SeedClaudeStateDir(stateRoot, clawkRootDir string) error {
 
 // claudeCredentialsPath is where claude reads and refreshes its OAuth
 // credentials, in host terms: inside the per-sandbox state dir that
-// PersistentClaudeShares mounts at ~/.claude/.
+// PersistentAgentShares mounts at ~/.claude/.
 func claudeCredentialsPath(stateRoot string) string {
 	return filepath.Join(stateRoot, "claude", ".credentials.json")
 }
@@ -274,7 +338,7 @@ const ToolchainCachesEnabled = false
 // transparent. Host dirs are created on demand (virtiofs refuses
 // missing source paths); MkdirAll failures silently drop the offending
 // share rather than failing sandbox creation, matching the behavior
-// of PersistentClaudeShares.
+// of PersistentAgentShares.
 //
 // Caches included (well-documented concurrent safety, real payoff):
 //
@@ -357,9 +421,15 @@ func ToolchainCacheShares(cacheDir string) []HostShare {
 //
 // Sharing Claude agents/commands and Codex skills is safe: user-authored
 // capability dirs with low write contention. Sharing .claude.json,
-// credentials, projects/, file-history/, or the whole ~/.codex state dir
-// would risk concurrent writers. Each sandbox authenticates independently —
-// one-time cost per sandbox in exchange for no cross-session corruption.
+// credentials, projects/, file-history/, or the rest of ~/.codex would risk
+// concurrent writers. Each sandbox authenticates independently — one-time
+// cost per sandbox in exchange for no cross-session corruption.
+//
+// "Not shared with the host" is not the same as "not persisted": the
+// runners' state dirs still survive down/up and destroy through
+// PersistentAgentShares, which gives each sandbox its OWN host directory.
+// These sub-mounts land inside those homes, so PersistentAgentShares must
+// be assembled first or the parent mount shadows them.
 //
 // ~/.claude/skills is deliberately NOT shared. A skill like gstack carries
 // a large node_modules tree, and virtio-fs caches an inode (and host fd)
@@ -444,7 +514,7 @@ func userShareTag(guestPath string) string {
 // Files that DO live inside ~/.claude/ — settings.json, CLAUDE.md,
 // .credentials.json — are pre-seeded into the per-sandbox state dir
 // by SeedClaudeStateDir before the VM boots; they appear at the
-// canonical paths through the PersistentClaudeShares mount, no
+// canonical paths through the PersistentAgentShares mount, no
 // snapshot-file involvement needed.
 //
 // clawkRootDir resolves the optional long-lived OAuth token
@@ -635,52 +705,126 @@ func shellEscapeDoubleQuoted(v string) string {
 	return shellEscapeDoubleQuotedReplacer.Replace(v)
 }
 
-// EnvFile synthesizes an /etc/profile.d script that exports every
-// sandbox-required env var. Entries come from sb.RequiredEnv (declared in
-// clawk.mod, in canonical envspec form); values are resolved against the
-// host's process env at this call.
+// DeclaredEnvNames is the set of guest variable names a sandbox's
+// `env ( … )` block declares, independent of whether any of them can be
+// resolved right now.
+//
+// Separate from ResolveEnv because the two answer different questions, and
+// conflating them is a security bug: "which names did the user speak for"
+// must not depend on the host shell. cli.buildVSockEnv suppresses clawk's
+// own injected variables for every declared name, and deriving that set
+// from ResolveEnv's output meant an entry that failed to resolve (a
+// ${HOST:?msg} whose host var left the shell) silently handed the name back
+// to clawk — re-injecting the Anthropic OAuth token into a sandbox whose
+// clawk.mod had explicitly disowned it. See config.MCPServer for why that
+// token must not reach a third-party endpoint.
+//
+// Entries that don't parse are skipped: they name nothing usable, and
+// ResolveEnv reports them.
+func DeclaredEnvNames(sb *config.Sandbox) map[string]bool {
+	if sb == nil || len(sb.RequiredEnv) == 0 {
+		return nil
+	}
+	names := make(map[string]bool, len(sb.RequiredEnv))
+	for _, entry := range sb.RequiredEnv {
+		spec, err := envspec.Parse(entry)
+		if err != nil {
+			continue
+		}
+		names[spec.Name] = true
+	}
+	return names
+}
+
+// ResolveEnv resolves a sandbox's declared `env ( … )` entries against the
+// host process environment, returning them as canonical NAME=value strings
+// in declaration order.
 //
 // Resolution follows the envspec grammar: a bare passthrough / ${HOST}
-// alias exports the host value (empty + a warning when unset); ${HOST:-x}
-// / ${HOST-x} fall back to a default; a bare/quoted literal is exported
-// verbatim; and ${HOST:?msg} / ${HOST?msg} make a missing variable a hard
-// error (returned here, failing sandbox creation with a clear message).
+// alias takes the host value (empty + a warning when unset); ${HOST:-x}
+// / ${HOST-x} fall back to a default; a bare/quoted literal is used
+// verbatim; and ${HOST:?msg} / ${HOST?msg} make a missing variable an
+// error.
 //
-// Written into /etc/profile.d/99-clawk-env.sh so every login shell
-// (ssh, `claude ...`, interactive bash, phase setup scripts) picks up
-// the values without any per-tool configuration.
+// It is the single resolution step behind both delivery paths, so a hard
+// failure or an unset-variable warning reads the same either way:
 //
-// Returns ok=false if the sandbox has no required env — saves the
-// caller from having to filter empty HostFiles.
-func EnvFile(sb *config.Sandbox) (HostFile, bool, error) {
+//   - EnvFile below, which renders /etc/profile.d/99-clawk-env.sh for
+//     every login shell in the guest.
+//   - the pty agent's vsock handshake (internal/cli.buildVSockEnv), which
+//     spawns the runner directly — no login shell, no /etc/profile — and
+//     so has to carry the values itself.
+//
+// Entries that fail to resolve are skipped but still reported, so the
+// returned slice always holds everything that DID resolve: strict callers
+// (sandbox create) treat a non-nil error as fatal, while best-effort
+// callers (agent attach, which must not become unusable just because one
+// variable left the host shell) can warn and carry on with the rest.
+//
+// Values are never persisted — they're read from the host env at call
+// time, which is why both callers re-resolve on every use.
+func ResolveEnv(sb *config.Sandbox) ([]string, error) {
 	if len(sb.RequiredEnv) == 0 {
-		return HostFile{}, false, nil
+		return nil, nil
 	}
-	var b bytes.Buffer
-	b.WriteString("# Generated by clawk — host env vars requested in clawk.mod\n")
+	out := make([]string, 0, len(sb.RequiredEnv))
+	var errs []error
 	for _, entry := range sb.RequiredEnv {
 		spec, err := envspec.Parse(entry)
 		if err != nil {
 			// The template parser already validated every entry, so this
 			// only fires on a hand-edited sandbox record — still worth a
 			// clear error rather than a malformed export line.
-			return HostFile{}, false, fmt.Errorf(
-				"sandbox %q: invalid env entry %q: %w", sb.Name, entry, err)
+			errs = append(errs, fmt.Errorf(
+				"sandbox %q: invalid env entry %q: %w", sb.Name, entry, err))
+			continue
 		}
 		val, warnUnset, err := spec.Resolve(os.LookupEnv)
 		if err != nil {
-			return HostFile{}, false, fmt.Errorf("sandbox %q: %w", sb.Name, err)
+			errs = append(errs, fmt.Errorf("sandbox %q: %w", sb.Name, err))
+			continue
 		}
 		if warnUnset {
 			fmt.Fprintf(os.Stderr,
 				"warning: %s required by clawk.mod is unset on host; "+
 					"exporting empty in sandbox %q\n", spec.Host, sb.Name)
 		}
+		out = append(out, spec.Name+"="+val)
+	}
+	return out, errors.Join(errs...)
+}
+
+// EnvFile synthesizes an /etc/profile.d script that exports every
+// sandbox-required env var. Entries come from sb.RequiredEnv (declared in
+// clawk.mod, in canonical envspec form); values are resolved by ResolveEnv
+// against the host's process env at this call, and a resolution failure
+// (e.g. an unset ${HOST:?msg}) is fatal here — it fails sandbox creation
+// with a clear message.
+//
+// Written into /etc/profile.d/99-clawk-env.sh so every login shell
+// (ssh, interactive bash, phase setup scripts, the `bash -lc` agent
+// fallback) picks up the values without any per-tool configuration. The
+// primary agent path does NOT go through a login shell — see ResolveEnv.
+//
+// Returns ok=false if the sandbox has no required env — saves the
+// caller from having to filter empty HostFiles.
+func EnvFile(sb *config.Sandbox) (HostFile, bool, error) {
+	entries, err := ResolveEnv(sb)
+	if err != nil {
+		return HostFile{}, false, err
+	}
+	if len(entries) == 0 {
+		return HostFile{}, false, nil
+	}
+	var b bytes.Buffer
+	b.WriteString("# Generated by clawk — host env vars requested in clawk.mod\n")
+	for _, e := range entries {
+		name, val, _ := strings.Cut(e, "=")
 		// Double-quoted with $ and " escaped — covers secrets that
 		// contain dollar signs or quotes. Single quotes aren't safe
 		// because bash single-quote strings can't contain single
 		// quotes, and API keys sometimes do.
-		fmt.Fprintf(&b, "export %s=\"%s\"\n", spec.Name, shellEscapeDoubleQuoted(val))
+		fmt.Fprintf(&b, "export %s=\"%s\"\n", name, shellEscapeDoubleQuoted(val))
 	}
 	return HostFile{
 		Content:   b.Bytes(),

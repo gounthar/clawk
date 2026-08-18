@@ -64,6 +64,7 @@ func applyNamespaceDefaults(sb *config.Sandbox) error {
 	sb.RequiredEnv = dedupStrings(append(sb.RequiredEnv, ns.Env...))
 	sb.Files = appendMissingFiles(sb.Files, ns.Files)
 	sb.Shares = appendMissingShares(sb.Shares, ns.Shares)
+	sb.MCP = appendMissingMCP(sb.MCP, ns.MCP)
 	// Namespace scope is broader than the sandbox's own (clawk.mod) entries,
 	// so it reads first: namespace instructions, then sandbox-specific.
 	sb.Instructions = append(append([]string{}, ns.Instructions...), sb.Instructions...)

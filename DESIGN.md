@@ -174,9 +174,13 @@ Everything lives under `~/.clawk/`, namespace-first:
   `suspend/` directory holding the saved memory + device state, consumed
   one-shot by the next boot and discarded by `clawk down`. Wiped by
   `destroy`.
-- `namespaces/<ns>/state/<name>/` — agent state mounted into the guest
-  (Claude projects/memory, Codex state). **Survives `destroy`** — recreating
-  a sandbox restores history.
+- `namespaces/<ns>/state/<name>/` — agent state mounted into the guest, one
+  subdirectory per runner home (`claude/` → `~/.claude`, `codex/` →
+  `~/.codex`, `pi/` → `~/.pi`, and `opencode-data/` + `opencode-config/` →
+  opencode's two XDG dirs). **Survives `destroy`** — recreating a sandbox restores
+  history. It also survives `down`/`up`, which the rootfs does not: vz
+  re-clones `disk.raw` from the image master on every boot, so a runner
+  whose home isn't mounted here starts fresh each time the VM comes up.
 - `namespaces/<ns>/worktrees/<name>/` — git worktrees for ticket-mode
   sandboxes.
 - `cache/` — built rootfs disks (CoW masters) and kernels, shared across
@@ -210,6 +214,12 @@ lexer + recursive-descent parser in the go.mod two-form style
 - **Egress:** default-deny beyond a built-in allow-list of common registries +
   the configured domains/IPs, enforced in the userspace stack the guest can't
   reconfigure.
+- **Host devices:** a serial port is reachable only if the user attached it,
+  and the guest names a *device*, never a host path — the mapping to
+  `/dev/cu.…` stays on the host, which validates every attach against the
+  configured set. The same shape as reverse forwarding, and deliberately not
+  a general "run something on the host" channel: the host picks the resource,
+  the guest only picks the bytes.
 - **Host credentials:** the ssh-agent is *forwarded* (keys stay on the host);
   the Claude OAuth token and any `files ( … )` secrets are pushed in
   deliberately and are the user's explicit choice.

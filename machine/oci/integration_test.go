@@ -48,8 +48,26 @@ func TestBuildAlpine_Integration(t *testing.T) {
 
 	assertValidRootFS(t, res.DiskPath)
 
+	// A cache hit is asserted by observing that the disk was not rebuilt, not
+	// by timing the call.
+	//
+	// Wall-clock is the wrong instrument here for two reasons. It is a proxy
+	// for "didn't redo the work" that depends entirely on the hardware the
+	// test happens to run on — and it isn't even measuring the network, since
+	// resolveSource calls crane.Digest to turn the tag into a digest BEFORE
+	// the cache lookup, so every Build makes a registry round-trip whose
+	// latency the test cannot bound. A one-second budget therefore fails on a
+	// slow or emulated host, and on a slow link, while the cache is working
+	// perfectly.
+	//
+	// The cache-hit path stats the done marker and returns; a miss re-pulls
+	// and rewrites disk.ext4. So an unchanged mtime, size and identity prove
+	// the artifact was reused, which is the property the timing bound was
+	// standing in for — and prove it deterministically.
 	t.Run("cache hit", func(t *testing.T) {
-		start := time.Now()
+		before, err := os.Stat(res.DiskPath)
+		require.NoError(t, err, "stat before cached Build")
+
 		res2, err := Build(ctx, Options{
 			Ref:      ref,
 			CacheDir: cache,
@@ -57,8 +75,14 @@ func TestBuildAlpine_Integration(t *testing.T) {
 		})
 		require.NoError(t, err, "cached Build")
 		require.Equal(t, res.DiskPath, res2.DiskPath, "cache miss")
-		d := time.Since(start)
-		require.LessOrEqual(t, d, time.Second, "cache hit too slow: %s (expected <1s)", d)
+
+		after, err := os.Stat(res2.DiskPath)
+		require.NoError(t, err, "stat after cached Build")
+		require.Equal(t, before.ModTime(), after.ModTime(),
+			"disk.ext4 was rewritten — the second Build rebuilt instead of hitting the cache")
+		require.Equal(t, before.Size(), after.Size(), "disk.ext4 changed size")
+		require.True(t, os.SameFile(before, after),
+			"disk.ext4 was replaced by a different file — the second Build rebuilt and renamed")
 	})
 
 	t.Run("materialize produces independent disks", func(t *testing.T) {

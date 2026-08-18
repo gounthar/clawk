@@ -299,6 +299,12 @@ func TestParseResourceErrors(t *testing.T) {
 		{"duplicate cpu", "cpu 2\ncpu 4\n", "duplicate"},
 		{"duplicate memory", "memory 1G\nmemory 2G\n", "duplicate"},
 		{"duplicate memory_max", "memory_max 1G\nmemory_max 2G\n", "duplicate"},
+		{"duplicate swap", "swap 1G\nswap 2G\n", "duplicate"},
+		{"bare swap number", "swap 4096", "unit suffix"},
+		{"empty swap", "swap\n", "expected size or 'off'"},
+		// The unit typo this floor exists for: `swap 512M` written meaning
+		// half a gigabyte is fine, but a bare small number is not.
+		{"swap below the floor", "swap 32M", "too small"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -312,6 +318,33 @@ func TestParseResourceErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseSwap(t *testing.T) {
+	cases := []struct {
+		src     string
+		wantMiB int64
+	}{
+		{"swap 8GiB", 8192},
+		{"swap 512M", 512},
+		// "off" and "0" store -1, not 0: the zero value has to keep meaning
+		// "unset" so the built-in default still applies to everyone else.
+		{"swap off", -1},
+		{"swap 0", -1},
+	}
+	for _, c := range cases {
+		t.Run(c.src, func(t *testing.T) {
+			tmpl, err := parseBody("vm (\n" + c.src + "\n)\n")
+			require.NoError(t, err)
+			require.Equal(t, c.wantMiB, tmpl.SwapMiB)
+		})
+	}
+
+	t.Run("unset stays zero", func(t *testing.T) {
+		tmpl, err := parseBody("vm (\n cpu 2\n)\n")
+		require.NoError(t, err)
+		require.Zero(t, tmpl.SwapMiB)
+	})
 }
 
 func TestParseIdleTimeout(t *testing.T) {

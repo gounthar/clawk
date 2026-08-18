@@ -109,7 +109,7 @@ func runnerNames() []string {
 
 // completeRunArgs is the position-aware ValidArgsFunction for `clawk run`:
 //
-//   - position 0: runner name (claude / codex / opencode / shell)
+//   - position 0: runner name (claude / codex / pi / opencode / shell)
 //   - position 1: sandbox name
 //   - position 2+: nothing (runner passthrough args follow `--`)
 func completeRunArgs(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {

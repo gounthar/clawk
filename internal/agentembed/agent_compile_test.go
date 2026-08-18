@@ -73,6 +73,38 @@ func TestAgentSourceCompiles(t *testing.T) {
 	}
 }
 
+// TestInitSourceCompiles is TestAgentSourceCompiles for clawk-init. The
+// init is built by the same guestbuild path and injected into every OCI
+// sandbox disk, but it went uncovered while only the agent was compiled
+// here — and it is the harder of the two to review by eye: PID 1, raw
+// syscalls, and no way to observe a failure except a guest that boots
+// wrong.
+func TestInitSourceCompiles(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("`go` not on PATH")
+	}
+	if os.Getenv("AGENT_TEST_NO_BUILD") != "" {
+		t.Skip("AGENT_TEST_NO_BUILD set")
+	}
+
+	tmp := t.TempDir()
+	mustWrite(t, filepath.Join(tmp, "main.go"), InitMainGo)
+	mustWrite(t, filepath.Join(tmp, "go.mod"), InitGoMod)
+
+	if out, err := runIn(t, tmp, "go", "mod", "tidy"); err != nil {
+		t.Fatalf("go mod tidy failed: %v\n%s", err, out)
+	}
+	bin := filepath.Join(tmp, "clawk-init")
+	if out, err := runIn(t, tmp, "go", "build", "-o", bin, "."); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+	fi, err := os.Stat(bin)
+	require.NoError(t, err, "init binary not produced")
+	if fi.Size() < 100*1024 {
+		t.Fatalf("init binary suspiciously small (%d bytes); build probably hollow", fi.Size())
+	}
+}
+
 // mustWrite writes content to path and fatals on error. Tiny helper so
 // the assertion-heavy tests above stay readable.
 func mustWrite(t *testing.T, path string, content []byte) {
@@ -97,4 +129,46 @@ func runIn(t *testing.T, dir, cmdName string, args ...string) ([]byte, error) {
 	cmd.Stderr = &buf
 	err := cmd.Run()
 	return buf.Bytes(), err
+}
+
+// TestSerialForwarderRuns compiles the agent into a throwaway module along
+// with its own test file and runs `go test` there.
+//
+// TestAgentSourceCompiles proves the agent builds; this proves its serial
+// half works. That half is a state machine over a PTY with several edges
+// that are invisible to a compiler and awkward to reason about: whether a
+// hangup really distinguishes "no client" from "idle client", whether a
+// baud change with no accompanying event is noticed at all, and whether the
+// attachment's lifetime tracks the client's open and close — which is what
+// makes a board reset at the right moment. Those are worth executing.
+//
+// Linux-only and native-arch only: the tests open PTYs and issue termios
+// ioctls, so they have to run rather than cross-compile.
+func TestSerialForwarderRuns(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the guest agent's serial tests need a Linux PTY; cross-compiling can't run them")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("`go` not on PATH")
+	}
+	if os.Getenv("AGENT_TEST_NO_BUILD") != "" {
+		t.Skip("AGENT_TEST_NO_BUILD set")
+	}
+
+	tmp := t.TempDir()
+	mustWrite(t, filepath.Join(tmp, "main.go"), AgentMainGo)
+	mustWrite(t, filepath.Join(tmp, "go.mod"), AgentGoMod)
+	mustWrite(t, filepath.Join(tmp, "serial_test.go"), SerialAgentTest)
+
+	if out, err := runIn(t, tmp, "go", "mod", "tidy"); err != nil {
+		t.Fatalf("go mod tidy failed: %v\n%s", err, out)
+	}
+	// Native, not cross-compiled: runIn pins GOOS/GOARCH for the build
+	// tests, and these have to actually execute.
+	cmd := exec.Command("go", "test", "-count=1", "-timeout=120s", "./...")
+	cmd.Dir = tmp
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("guest agent serial tests failed: %v\n%s", err, out)
+	}
 }

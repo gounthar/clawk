@@ -91,7 +91,7 @@ func runFcd(_ *cobra.Command, args []string) (retErr error) {
 	// No reverse-forward sink: firecracker's vsock is one-way (guest listens,
 	// host dials), so there is nothing for the guest agent to dial. The
 	// endpoint 404s and the CLI says so.
-	ctl, err := vzdctl.Start(vzdctl.SocketPath(vmDir), controlHandlers(sb, allow, lc, nil, logger))
+	ctl, err := vzdctl.Start(vzdctl.SocketPath(vmDir), controlHandlers(sb, allow, lc, nil, nil, logger))
 	if err != nil {
 		logger.Printf("control socket: disabled (%v) — network edits apply on next up", err)
 	} else {

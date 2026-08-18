@@ -67,8 +67,14 @@ type statusJSONOutput struct {
 	// v2 additive blocks.
 	Forwards        []statusJSONForward `json:"forwards,omitempty"`
 	ReverseForwards []statusJSONForward `json:"reverse_forwards,omitempty"`
+	Serials         []statusJSONSerial  `json:"serials,omitempty"`
 	Network         *statusJSONNetwork  `json:"network,omitempty"`
 	Setup           []statusJSONSetup   `json:"setup,omitempty"`
+}
+
+type statusJSONSerial struct {
+	HostPath  string `json:"host_path"`
+	GuestName string `json:"guest_name"`
 }
 
 type statusJSONBranch struct {
@@ -191,6 +197,11 @@ func renderStatusJSON(w io.Writer, sb *config.Sandbox, liveStatus string) error 
 			HostPort: f.HostPort, GuestPort: f.GuestPort,
 		})
 	}
+	for _, d := range sb.Serials {
+		out.Serials = append(out.Serials, statusJSONSerial{
+			HostPath: d.HostPath, GuestName: d.GuestName,
+		})
+	}
 	out.Network = &statusJSONNetwork{
 		Use:    effectiveUseForLog(sb),
 		Blocks: sb.Network.Blocks,
@@ -290,6 +301,15 @@ func renderStatusDashboard(w io.Writer, provider sandbox.Provider, sb *config.Sa
 			parts = append(parts, fmt.Sprintf("%d → %d", f.GuestPort, f.HostPort))
 		}
 		fmt.Fprintf(w, "  Reverse     %s (guest → host loopback)\n", strings.Join(parts, ", "))
+	}
+	// Same direction convention as the rows above: what the guest sees on
+	// the left, what it reaches on the right.
+	if len(sb.Serials) > 0 {
+		parts := make([]string, 0, len(sb.Serials))
+		for _, d := range sb.Serials {
+			parts = append(parts, fmt.Sprintf("/dev/%s → %s", d.GuestName, d.HostPath))
+		}
+		fmt.Fprintf(w, "  Serial      %s\n", strings.Join(parts, ", "))
 	}
 
 	// One line per policy layer, lowest precedence first: the use chain,

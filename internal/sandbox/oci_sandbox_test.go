@@ -81,7 +81,7 @@ func TestOCIGuestManifest(t *testing.T) {
 		t.Errorf("workspace parent (idx %d) must be mounted before in-place sub-mount (idx %d)", wsIdx, hereIdx)
 	}
 	if mt, ok := mounts["claude_home"]; !ok || mt.Path != GuestHome+"/.claude" {
-		// PersistentClaudeShares' tag; if its tag ever changes this test
+		// PersistentAgentShares' tag; if its tag ever changes this test
 		// must change together with collectSandboxShares.
 		t.Errorf("claude state mount missing/wrong: %+v", mounts)
 	}

@@ -66,6 +66,12 @@ clawk policy refresh <name>
 clawk policy delete <name>
 ```
 
+One layer is derived rather than written: each `http`/`sse` server in an
+`mcp ( … )` block contributes an allow for its host (see
+[MCP servers](mcp.md)). It sits just above the namespace layer, below
+everything you wrote yourself — so declaring a server saves you a `network
+allow` line, but a `deny` of your own still wins.
+
 `clawk apply -f <file-or-dir>` registers `policy` and `namespace` blocks
 from manifest files (same grammar, no sandbox created). A directory
 applies every file independently — one broken manifest is reported by name
@@ -119,6 +125,11 @@ rather than silently doing nothing.
 
 Reverse forwards can also be declared in `clawk.mod` — see
 [Configuration](configuration.md#reference).
+
+A serial port is the same idea pointed at hardware rather than a socket:
+`clawk serial add` puts a USB-serial device from your Mac into the guest as
+`/dev/<name>`, over the same vsock transport and with the same live-apply and
+vz-only caveats. See [Serial devices](serial.md).
 
 ### Recipe: the Claude Code IDE plugin
 

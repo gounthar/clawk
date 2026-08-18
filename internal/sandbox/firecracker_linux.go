@@ -63,6 +63,11 @@ const (
 	// are attached in spec order after the rootfs (machine/firecracker puts
 	// rootfs first, then Spec.Disks), so vda=rootfs, vdb=guestcfg, vdc=this.
 	fcWorktreeDevice = "/dev/vdc"
+	// fcSwapDevice is the swap disk, attached after the worktree — so
+	// vda=rootfs, vdb=guestcfg, vdc=worktree, vdd=this. Firecracker's
+	// virtio-blk advertises no discard, so freed swap pages stay allocated in
+	// the backing file (see sandbox.DefaultSwapSizeMiB).
+	fcSwapDevice = "/dev/vdd"
 	// worktreeDiskSlack is the free space added to a worktree disk beyond the
 	// tree itself, for whatever the agent builds in there. Sparse, so unused
 	// capacity costs nothing on the host.
@@ -151,6 +156,9 @@ func (f *FirecrackerProvider) Create(sb *config.Sandbox) error {
 	if err := guestcfg.WriteDisk(f.manifest(sb), filepath.Join(vmDir, "guestcfg.img")); err != nil {
 		return fmt.Errorf("guest config disk: %w", err)
 	}
+	if _, err := EnsureSwapDisk(vmDir, SwapDiskMiB(sb)); err != nil {
+		return fmt.Errorf("swap disk: %w", err)
+	}
 	sb.GuestIP = guestIP
 	return nil
 }
@@ -171,7 +179,11 @@ func (f *FirecrackerProvider) hasRestorableState(sb *config.Sandbox, vmDir, root
 	if !machine.SuspendStateExists(filepath.Join(vmDir, "suspend")) {
 		return false
 	}
-	for _, disk := range []string{rootfs, f.worktreeDiskPath(sb), filepath.Join(vmDir, "guestcfg.img")} {
+	disks := []string{rootfs, f.worktreeDiskPath(sb), filepath.Join(vmDir, "guestcfg.img")}
+	if SwapDiskMiB(sb) > 0 {
+		disks = append(disks, SwapDiskPath(vmDir))
+	}
+	for _, disk := range disks {
 		if _, err := os.Stat(disk); err != nil {
 			return false
 		}
@@ -195,6 +207,7 @@ func (f *FirecrackerProvider) manifest(sb *config.Sandbox) guestcfg.Manifest {
 			DNS:       []string{gvproxyGateway},
 			MTU:       gvproxyMTU,
 		},
+		Swap: fcSwap(sb),
 		Mounts: []guestcfg.Mount{{
 			Path:   f.guestWorktreePath(sb),
 			Block:  fcWorktreeDevice,
@@ -202,6 +215,16 @@ func (f *FirecrackerProvider) manifest(sb *config.Sandbox) guestcfg.Manifest {
 		}},
 		Services: []guestcfg.Service{{Name: "pty-agent", Path: guestcfg.AgentPath}},
 	}
+}
+
+// fcSwap is the manifest's swap entry, or nil when the sandbox opted out.
+// Keyed off the same SwapDiskMiB as buildSpec's disk list so the manifest
+// never names a device firecracker wasn't asked to attach.
+func fcSwap(sb *config.Sandbox) *guestcfg.Swap {
+	if SwapDiskMiB(sb) == 0 {
+		return nil
+	}
+	return &guestcfg.Swap{Device: fcSwapDevice, Swappiness: GuestSwappiness}
 }
 
 // guestWorktreePath is where the worktree disk is mounted in the guest —
@@ -456,6 +479,13 @@ func (f *FirecrackerProvider) DaemonSpec(sb *config.Sandbox, allow *netfilter.Al
 		cleanup()
 		return machine.Spec{}, nil, fmt.Errorf("kernel: %w", err)
 	}
+	// Ensured on every boot, not just at create, so an edited
+	// `vm ( swap <size> )` takes effect on the next start — buildSpec attaches
+	// whatever SwapDiskMiB says, and the device has to exist by then.
+	if _, err := EnsureSwapDisk(f.vmDir(sb), SwapDiskMiB(sb)); err != nil {
+		cleanup()
+		return machine.Spec{}, nil, fmt.Errorf("swap disk: %w", err)
+	}
 	spec := f.buildSpec(sb, kernelPath)
 	if ns != nil {
 		// Handed over here and nowhere earlier: machine.UserMode documents that
@@ -508,6 +538,13 @@ func (f *FirecrackerProvider) buildSpec(sb *config.Sandbox, kernelPath string) m
 	if sb.MemoryMaxMiB > memMaxMiB {
 		memMaxMiB = sb.MemoryMaxMiB
 	}
+	disks := []machine.Disk{
+		{Path: filepath.Join(f.vmDir(sb), "guestcfg.img"), ReadOnly: true},
+		{Path: f.worktreeDiskPath(sb)},
+	}
+	if SwapDiskMiB(sb) > 0 {
+		disks = append(disks, machine.Disk{Path: SwapDiskPath(f.vmDir(sb))})
+	}
 	return machine.Spec{
 		ID:           sb.Name,
 		VCPU:         vcpu,
@@ -523,12 +560,9 @@ func (f *FirecrackerProvider) buildSpec(sb *config.Sandbox, kernelPath string) m
 		},
 		RootFS: machine.RawDisk{Path: filepath.Join(f.vmDir(sb), "rootfs.raw")},
 		// Order is the guest's device order: vdb=guestcfg, vdc=worktree
-		// (fcWorktreeDevice). Appending anything here shifts later devices,
-		// so keep new disks after these two.
-		Disks: []machine.Disk{
-			{Path: filepath.Join(f.vmDir(sb), "guestcfg.img"), ReadOnly: true},
-			{Path: f.worktreeDiskPath(sb)},
-		},
+		// (fcWorktreeDevice), vdd=swap (fcSwapDevice). Appending anything here
+		// shifts later devices, so keep new disks after these.
+		Disks:    disks,
 		VSockCID: fcVSockCID,
 		Serial:   machine.Serial{LogPath: filepath.Join(f.vmDir(sb), "console.log")},
 	}

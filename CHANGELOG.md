@@ -7,6 +7,224 @@ tagged.
 
 ## Unreleased
 
+## v0.4.0
+
+### Added
+
+- **Host-wide defaults: `~/.config/clawk/clawk.mod`.** One file outside any
+  repo whose anonymous `sandbox ( … )` block supplies settings for every
+  sandbox on the machine — including repos with no `clawk.mod` at all. It is
+  the lowest layer of the chain (built-in defaults < host-wide < namespace <
+  repo `clawk.mod` < `clawk.mod.<profile>` < flags): lists union with the
+  host-wide entries first, scalars apply only where nothing narrower declared
+  one. Read at create time like every other template, so editing it shapes the
+  next sandbox rather than retro-modifying existing ones.
+  ([#14](https://github.com/clawkwork/clawk/issues/14))
+
+  The point is that a kernel path, a token alias, a personal skill mount and a
+  house rule about commit messages are properties of the host, not of the repo
+  they happened to be written in — and committing them puts an absolute
+  `/Users/you/...` path in a shared file.
+
+  Location resolves `$CLAWK_GLOBAL_MOD` (explicit, must exist) →
+  `$XDG_CONFIG_HOME/clawk/clawk.mod` → `~/.clawk/clawk.mod` (compatibility).
+  `~/.config` is the documented home because this is the one file in clawk's
+  footprint you hand-edit and may symlink out of a dotfiles repo, whereas
+  `~/.clawk` is disposable machine state — VM disks, an image cache, a live
+  OAuth token — that people exclude from backups and delete to start clean.
+  Both present is an error, not a silent pick.
+
+  Scope is enforced: the block must be anonymous (a header name labels one
+  repo's phases, so a name here would silently relabel every repo), `includes`
+  and the unwired `on down` / `on enter` are rejected, `policy` blocks are
+  accepted as a personal policy library, and `namespace` blocks are refused —
+  the file declares defaults for every sandbox, not named resources, and clawk
+  owns those records itself. Relative paths resolve against the file's own
+  directory. `--no-global` drops the layer for a reproducible run.
+
+- **Serial devices.** `clawk serial add <sandbox> /dev/cu.usbmodem1101` puts a
+  serial port plugged into your Mac inside the sandbox as `/dev/<name>`, so
+  `arduino-cli`, `esptool`, `avrdude` and a serial monitor can run in there
+  against real hardware. Declarable in `clawk.mod` as `serial ( … )`, applied
+  live like reverse forwards, and vz-only for the same reason.
+
+  The USB device is not passed through, because nothing clawk runs on can do
+  that: Virtualization.framework's USB controller carries virtual
+  mass-storage devices only, and firecracker has no USB at all. What crosses
+  is the byte stream and the line settings — which is all any of those tools
+  ever wanted from a serial port. The guest side is a PTY; the host side is
+  the real tty, opened only while a process in the sandbox holds the device,
+  so the board stays available to the Mac the rest of the time.
+
+  Tying the host's open to the guest's open is also what makes auto-reset
+  work: opening a serial port asserts DTR, which is the pulse a board's reset
+  circuit is waiting for. A PTY carries the baud rate too, so the 1200-baud
+  touch that native-USB boards use to enter their bootloader survives the
+  trip. What a PTY cannot carry is a modem-control line under direct control
+  — a plain ESP32 DevKit that needs DTR and RTS driven in sequence still
+  needs its BOOT button. [docs/serial.md](docs/serial.md) has the full table.
+
+  A device may be named by a glob (`'/dev/cu.usbmodem*:ttyACM0'`), resolved
+  each time the port is opened rather than when it is configured, so a board
+  that re-enumerates into its bootloader under a neighbouring name stays
+  reachable. The guest-side name never changes, so `-p /dev/ttyACM0` keeps
+  working across the whole flash cycle.
+
+- **Sandboxes now boot with swap.** Every sandbox gets a swap device — 2 GiB
+  by default, sized with `vm ( swap <size> )` and disabled with
+  `vm ( swap off )`.
+
+  The reason is the balloon controller, not the guest's appetite. Under host
+  memory pressure clawk takes RAM back from a guest against its demand (75%
+  of the ceiling at WARN, 50% at CRITICAL), and a guest with nowhere to put
+  cold anonymous pages answers that with direct-reclaim stalls and, at the
+  limit, its OOM killer. A multi-second stall in the agent process is not
+  merely slow: a process that stops draining its socket lets the connection
+  go idle, and on a link whose NAT reaps idle mappings in well under a minute
+  — a phone hotspot, a hotel network — that ends the streaming API response
+  outright. Swap turns the stall into paging.
+
+  It rides on its own sparse virtio-blk device rather than a swapfile on the
+  rootfs, because `swapon(2)` rejects a file with holes: a swapfile would
+  cost its full size in real host bytes at first boot, per sandbox. The
+  device costs only the pages actually swapped. Note that nothing punches
+  those holes back — no virtio-blk in the stack advertises discard yet — so
+  read the usage as a high-water mark until the sandbox is destroyed.
+
+  The balloon controller learned about swap at the same time, and had to:
+  paging out cold pages raises `MemAvailable` and lowers PSI, so a guest that
+  answered a squeeze by swapping reads as *roomy* on both of the signals the
+  controller uses. Left alone it would have reclaimed another step, and
+  parked working guests at their baseline, swapping, for good.
+
+- **`mcp ( … )`: MCP servers ready on first boot.** Declare the servers a
+  project needs and every sandbox created from that `clawk.mod` comes up with
+  them configured — no per-sandbox setup, no interactive login inside the VM:
+
+  ```text
+  mcp (
+      linear https://mcp.linear.app/mcp  header "Authorization: Bearer ${LINEAR_TOKEN}"
+      github stdio "npx -y @modelcontextprotocol/server-github"  env GITHUB_TOKEN
+  )
+  ```
+
+  Declaring a server also allows its host in the egress policy, in a derived
+  `mcp` layer that ranks below anything you wrote yourself — so a remote
+  server doesn't need a matching `network allow`, and doesn't get to
+  override your own `deny`. Valid in a repo file, a workspace root and a
+  `namespace` block, merging by name with the narrowest scope winning, so a
+  namespace can carry the org-wide set.
+
+  Credential values stay out of clawk entirely: `clawk.mod` and the rendered
+  guest config hold a `${VAR}` reference, and the value travels from your
+  shell to the runner's process environment at attach time. Pair it with
+  `env ( TOKEN = ${TOKEN:?message} )` and a missing PAT fails sandbox
+  creation with your message instead of surfacing as a 401 mid-task. Static
+  credentials only — that's what can be in place before the VM boots. See
+  [docs/mcp.md](docs/mcp.md).
+
+- **The pi coding agent is a built-in runner.** `clawk run pi` attaches
+  [pi](https://github.com/earendil-works/pi) the same way `clawk run claude`
+  and `clawk run codex` do, and the `clawk-dev` image ships it. `pi.dev` (its
+  model catalog and version check) joins the default network allow-list, and
+  its `~/.pi/` is persisted per sandbox like the other runners'.
+
+  The image also gains `fd-find`. pi's search tools probe PATH for `rg` and
+  `fd`/`fdfind` and download GitHub release tarballs when they're missing —
+  the image had ripgrep but not fd, so every fresh sandbox printed "fd not
+  found. Downloading..." on pi's first run. Debian ships the binary as
+  `fdfind`, one of the names pi probes for, so the package alone settles it.
+
+- **opencode is a fully wired runner.** It was in the registry but nothing
+  else: not installed in `clawk-dev`, and not persisted. Both are fixed, so
+  `clawk run opencode` works out of the box and its sessions and login
+  survive `down`/`up` and `destroy` like every other runner's.
+
+  It launches with `--auto` (approve anything not explicitly denied); a deny
+  rule in your `opencode.jsonc` still wins, and `--safe` drops the flag.
+  `opencode.ai` joins the default network allow-list, alongside the
+  `models.dev` entry it already had.
+
+  opencode is the one runner needing two state mounts: it follows the XDG
+  split rather than keeping a single home, so `~/.local/share/opencode`
+  (auth.json, mcp-auth.json, opencode.db, repos/) and `~/.config/opencode`
+  are mounted separately. Its `~/.local/state/opencode` and
+  `~/.cache/opencode` deliberately stay on the disposable rootfs — the
+  former holds only lock files, and a lock outliving the VM that took it is
+  worse than none.
+
+  Note the image grows by roughly 180 MB: `opencode-ai` resolves a prebuilt
+  platform binary rather than shipping JS. Drop it from the Dockerfile's npm
+  line for a slimmer variant.
+
+  pi launches with `--approve`. It has no approval prompts to bypass — it
+  ships no built-in sandbox at all, by design, on the grounds that real
+  isolation has to come from a VM — but it does gate project-local
+  `.pi/settings.json` and `.pi/extensions` behind an interactive trust
+  prompt, and answering that inside a sandbox whose whole premise is that
+  the project already has the machine is theatre. `--safe` drops the flag
+  like it does for the other runners. A sandbox declaring `mcp ( … )` gets
+  no config flag for pi: pi loads MCP through an extension rather than a
+  config file.
+
+### Fixed
+
+- Workspace-position `env ( … )` and `agent ( … )` blocks were silently
+  dropped: only a repo's own `clawk.mod` fed the sandbox's required-env set and
+  agent instructions, so a workspace root declaring `env ( GITHUB_TOKEN )` got
+  nothing. They now apply, ordered scope-outward (workspace, then namespace,
+  then repo).
+
+- **An `env ( … )` declaration now overrides clawk's own variables.** The
+  vsock handshake emitted clawk's vars — `CLAUDE_CODE_OAUTH_TOKEN`,
+  `COLORTERM`, the terminal-identification set — *after* the sandbox's
+  declared env, so they won on the last-write-wins fold in the guest agent
+  and a `clawk.mod` declaration of the same name was silently discarded.
+
+  The two other delivery paths already disagreed with it: `/etc/profile.d`
+  sources `99-clawk-env.sh` after `98-clawk-claude-oauth.sh`, so login
+  shells and the `bash -lc` exec fallback have always let the declaration
+  win. Only the default path — the one `clawk run claude` uses — did not.
+
+  The case that needs it: a sandbox with `ANTHROPIC_BASE_URL` pointed at a
+  gateway that needs no credential of its own. Claude Code falls back to
+  `CLAUDE_CODE_OAUTH_TOKEN` when `ANTHROPIC_AUTH_TOKEN` is unset, so clawk's
+  `sk-ant-oat-…` was sent to that third-party endpoint as an
+  `Authorization: Bearer` header — a token leak, and one no clawk.mod could
+  prevent. `env ( CLAUDE_CODE_OAUTH_TOKEN = "" )` now expresses it per
+  sandbox; previously the only lever was `clawk auth clear`, which disarms
+  every sandbox on the host. clawk still supplies all of these when the
+  sandbox says nothing about them.
+
+- **Codex no longer loses its history on `clawk down && clawk up`.** Only
+  `~/.claude` was mounted from the host; `~/.codex` lived on the VM rootfs,
+  which vz re-clones from the image master on *every* boot. So codex's
+  sessions, `history.jsonl` and login were discarded by a plain stop/start —
+  not just by `clawk destroy` — even though the docs promised
+  `state/<name>/codex/` was mounted at `~/.codex/`. Each runner's home
+  directory is now a per-sandbox host mount under
+  `~/.clawk/namespaces/<ns>/state/<name>/` — `~/.claude`, `~/.codex`,
+  `~/.pi`, and opencode's two XDG directories — so `--resume` works across
+  stops and recreates for all of them.
+
+  Existing sandboxes pick this up on their next boot; history from before
+  the fix was on the disposable disk and is not recoverable. Note that this
+  costs four more virtio devices on every sandbox against the 32-device
+  PCIe ceiling: a large multi-repo workspace that booted on v0.3.0 may now
+  be refused at start, with a message naming the count and what to cut.
+
+- **`env ( … )` vars now reach the agent process, not just its shells.** The
+  pty agent spawns the runner directly, so `/etc/profile.d/99-clawk-env.sh`
+  was never sourced for it: declared variables were visible to a login shell
+  the agent started, but absent from the agent's own environment. Anything
+  reading it saw nothing — including `${VAR}` expansion in MCP config, where
+  a forwarded token would silently become an empty header. The values now
+  ride the vsock handshake alongside `CLAUDE_CODE_OAUTH_TOKEN`, resolved from
+  your shell on every dispatch (so rotating a token needs no VM cycle), and
+  layered so that clawk's own vars fill in only the names your `clawk.mod`
+  didn't claim (see the entry above). As a side effect the agent's shell tool
+  sees `GITHUB_TOKEN` and friends without `bash -lc`.
+
 ## v0.3.0
 
 ### Added

@@ -2,8 +2,11 @@ package config
 
 import (
 	"fmt"
+	"path"
+	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -122,20 +125,32 @@ type NetworkBlock struct {
 // silently invert which rules win.
 const (
 	BlockOriginNamespace = "namespace"
-	BlockOriginMod       = "mod"
-	BlockOriginCustom    = "custom"
+	// BlockOriginMCP carries the allow entries derived from declared MCP
+	// servers (see MCPServer). Deliberately the lowest-precedence stored
+	// origin above "namespace": it is a convenience — clawk inferring what
+	// a declared server needs to reach — so an explicit `deny` written in
+	// clawk.mod ("mod") or via the CLI ("custom") must still win over it.
+	BlockOriginMCP    = "mcp"
+	BlockOriginMod    = "mod"
+	BlockOriginCustom = "custom"
 )
 
 // blockOriginRank orders stored blocks; unknown origins sort first so a
 // record written by a newer clawk never outranks the user's custom block.
+//
+// The numbers are computed, never persisted — only the origin strings above
+// are frozen — so inserting a new origin mid-chain is a matter of
+// renumbering here.
 func blockOriginRank(origin string) int {
 	switch origin {
 	case BlockOriginNamespace:
 		return 1
-	case BlockOriginMod:
+	case BlockOriginMCP:
 		return 2
-	case BlockOriginCustom:
+	case BlockOriginMod:
 		return 3
+	case BlockOriginCustom:
+		return 4
 	default:
 		return 0
 	}
@@ -224,7 +239,9 @@ var DefaultAllowedDomains = []string{
 	"claude.ai",
 	"gemini.google.com",
 	"generativelanguage.googleapis.com",
-	"models.dev", // model catalog fetched by the opencode runner
+	"models.dev",  // model catalog fetched by the opencode runner
+	"opencode.ai", // auth + update check for the opencode runner
+	"pi.dev",      // model catalog + version check fetched by the pi runner
 	"platform.claude.com",
 	"play.googleapis.com",
 	"statsig.anthropic.com",
@@ -386,6 +403,62 @@ func (p PortForward) String() string {
 	return fmt.Sprintf("%d:%d", p.HostPort, p.GuestPort)
 }
 
+// SerialDevice is a host serial port presented as a PTY inside the guest —
+// an Arduino or ESP32 on the Mac's USB, reachable from tooling in the
+// sandbox. Bytes and line configuration are tunnelled over vsock (see
+// internal/serialfwd); the USB device itself is not passed through, because
+// no hypervisor clawk targets can do that.
+//
+// Like ReverseForwards these apply live to a running sandbox, and for the
+// same reason they are vz-only: the guest is the end that dials.
+type SerialDevice struct {
+	// HostPath is the device on the host, e.g. /dev/cu.usbmodem1101 on
+	// macOS or /dev/ttyACM0 on Linux. It may be a glob, which is resolved
+	// at open time rather than when it is configured — boards that
+	// re-enumerate into a bootloader often come back under a neighbouring
+	// name, and `/dev/cu.usbmodem*` survives that where a literal path
+	// doesn't. A glob that matches more than one device at open time is an
+	// error, not a guess.
+	HostPath string `json:"host_path"`
+
+	// GuestName is the basename the PTY is symlinked to inside the guest,
+	// at /dev/<GuestName>. Never a path: the guest refuses anything with a
+	// directory part, and so does the host on the way in.
+	GuestName string `json:"guest_name"`
+}
+
+// String renders the device in the HOST:GUEST spelling the CLI accepts,
+// collapsing to the bare host path when the guest name is the default.
+func (s SerialDevice) String() string {
+	if s.GuestName == DefaultSerialGuestName(s.HostPath) {
+		return s.HostPath
+	}
+	return fmt.Sprintf("%s:%s", s.HostPath, s.GuestName)
+}
+
+// IsGlob reports whether HostPath is a pattern to resolve at open time
+// rather than a literal device path.
+func (s SerialDevice) IsGlob() bool { return strings.ContainsAny(s.HostPath, "*?[") }
+
+// DefaultSerialGuestName is the guest name used when a spec doesn't give
+// one: the host device's basename, unchanged.
+//
+// Keeping the name identical on both sides is the same choice reverse
+// forwarding makes with ports — you refer to the thing by the name you
+// already know it by, and there is no second identifier to keep straight.
+// A Mac's /dev/cu.usbmodem1101 is an odd name for a Linux device node, but
+// no tool cares, and `arduino-cli -p /dev/cu.usbmodem1101` reading the same
+// on both sides is worth more than tidiness.
+//
+// Returns "" for a glob, which has no meaningful basename; callers must
+// require an explicit name in that case.
+func DefaultSerialGuestName(hostPath string) string {
+	if strings.ContainsAny(hostPath, "*?[") {
+		return ""
+	}
+	return path.Base(filepath.ToSlash(hostPath))
+}
+
 // HostFile is a snapshot-on-up file pushed from host into guest. Sourced
 // from clawk.mod `files (...)` and refreshed on every `clawk up` — edits
 // on the host are NOT live (use HostShare for that). HostPath is tilde-
@@ -407,6 +480,55 @@ type HostShare struct {
 	HostPath  string `json:"host_path"`
 	GuestPath string `json:"guest_path"`
 	ReadOnly  bool   `json:"read_only"`
+}
+
+// MCP transport identifiers. Persisted in sandbox records — frozen (see
+// VMState). These are the wire names Claude Code's MCP config uses, so a
+// rendered server config can pass them straight through.
+const (
+	MCPTransportHTTP  = "http"
+	MCPTransportSSE   = "sse"
+	MCPTransportStdio = "stdio"
+)
+
+// MCPServer is one entry of a clawk.mod `mcp ( … )` block: an MCP server
+// made available to the agent inside the sandbox. Sourced from the
+// namespace and clawk.mod, snapshotted onto the record at create like
+// every other template value, and rendered into the guest by
+// sandbox.SeedClaudeMCP.
+//
+// Credentials are deliberately NOT modeled here. A `${VAR}` reference in
+// Headers or Env is stored and rendered verbatim; the runner expands it
+// against its own process environment at connect time (confirmed for
+// headers, env and args). That keeps this record — and the rendered guest
+// config, which lives on host disk under the sandbox state dir — free of
+// secret values, exactly like RequiredEnv. The value itself travels
+// separately: declare the variable in `env ( … )` and it reaches the
+// runner's environment via the vsock handshake (see sandbox.ResolveEnv).
+//
+// Only static-credential transports are supported. Interactive OAuth
+// (`claude mcp login`) stores its grant inside the guest and is out of
+// scope: it can't be arranged at create time, which is the whole point of
+// declaring servers here.
+type MCPServer struct {
+	// Name is the server's identifier, as the agent sees it. Unique
+	// within a sandbox.
+	Name string `json:"name"`
+	// Transport is one of the MCPTransport* constants above.
+	Transport string `json:"transport"`
+	// URL is the endpoint for the http and sse transports; empty for stdio.
+	URL string `json:"url,omitempty"`
+	// Command is the argv of a stdio server, already split into words.
+	// Empty for http and sse.
+	Command []string `json:"command,omitempty"`
+	// Headers are extra HTTP request headers in "Name: value" form, for
+	// http and sse. This is where a PAT goes:
+	// "Authorization: Bearer ${SENTRY_TOKEN}".
+	Headers []string `json:"headers,omitempty"`
+	// Env names the environment variables handed to a stdio server. Each
+	// is rendered as NAME=${NAME}, so the value comes from the runner's
+	// environment rather than from this record.
+	Env []string `json:"env,omitempty"`
 }
 
 // DefaultNamespace is the grouping a sandbox belongs to when none is set.
@@ -451,6 +573,10 @@ type Sandbox struct {
 	// by the daemon, so edits apply to a running sandbox. See
 	// internal/revfwd.
 	ReverseForwards []PortForward `json:"reverse_forwards,omitempty"`
+	// Serials are host serial ports presented as PTYs in the guest — see
+	// SerialDevice and internal/serialfwd. Like ReverseForwards these are
+	// tunnelled over vsock and apply to a running sandbox.
+	Serials []SerialDevice `json:"serials,omitempty"`
 	// Files is the list of host->guest file copies refreshed on every
 	// `clawk up`. See HostFile. Empty = no snapshots.
 	Files []HostFile `json:"files,omitempty"`
@@ -466,6 +592,13 @@ type Sandbox struct {
 	// block read on every boot — the place for "always ask before X" or
 	// project conventions that must survive a throwaway VM.
 	Instructions []string `json:"instructions,omitempty"`
+	// MCP is the set of MCP servers made available to the agent inside the
+	// sandbox, sourced from the namespace and clawk.mod's `mcp ( … )`
+	// block. Rendered into the guest before first boot, and each http/sse
+	// entry's host is folded into the network policy's "mcp" block so a
+	// declared server is reachable without a separate `network allow`.
+	// See MCPServer.
+	MCP []MCPServer `json:"mcp,omitempty"`
 	// Memory is seed content for the agent's auto-memory MEMORY.md, sourced
 	// from the namespace and clawk.mod. Written into the memory dir once on
 	// first boot and never afterward (see sandbox.SeedClaudeMemory), so a
@@ -533,6 +666,12 @@ type Sandbox struct {
 	// It's baked into the rootfs at build time, so a change takes effect on
 	// the next rootfs (re)build.
 	DiskMiB uint64 `json:"disk_mib,omitempty"`
+
+	// SwapMiB is the sparse swap device's capacity in mebibytes, from
+	// clawk.mod `vm ( swap <size|off> )`. Zero = sandbox.DefaultSwapSizeMiB;
+	// negative = no swap device at all. Unlike DiskMiB this is not baked into
+	// the rootfs — the device is a separate file, resized on the next boot.
+	SwapMiB int64 `json:"swap_mib,omitempty"`
 
 	// IdleTimeoutSec is how long the sandbox may sit idle (no attached
 	// session, quiescent guest) before its VM daemon stops it to reclaim
